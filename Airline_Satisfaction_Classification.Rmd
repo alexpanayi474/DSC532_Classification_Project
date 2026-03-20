@@ -1,0 +1,655 @@
+---
+title: "Classification Analysis: Airline Passenger Satisfaction"
+author: "DSC532 Group Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.width = 10, fig.height = 6
+)
+```
+
+# Setup and Libraries
+
+```{r libraries}
+# Install packages if needed (uncomment on first run)
+# install.packages(c("tidyverse", "janitor", "skimr", "corrplot", "caret",
+#                     "MASS", "pROC", "knitr", "kableExtra", "gridExtra"))
+
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(corrplot)
+library(caret)
+library(MASS)
+library(pROC)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+
+set.seed(42)
+```
+
+# Data Loading and Overview
+
+```{r load-data}
+train_raw <- read_csv("train.csv")
+test_raw  <- read_csv("test.csv")
+
+cat("Training set dimensions:", dim(train_raw), "\n")
+cat("Test set dimensions:", dim(test_raw), "\n")
+```
+
+```{r first-look}
+glimpse(train_raw)
+```
+
+```{r}
+head(train_raw)
+```
+
+```{r}
+summary(train_raw)
+```
+
+# Data Cleaning
+
+## Removing Identifiers and Standardising Column Names
+
+We remove the unnamed index column (`...1`) and the `id` column since they carry no predictive information, and apply `clean_names()` for consistent snake_case naming.
+
+```{r clean-names}
+train_clean <- train_raw %>%
+  clean_names() %>%
+  dplyr::select(-any_of(c("x1", "x_1")), -id)
+
+test_clean <- test_raw %>%
+  clean_names() %>%
+  dplyr::select(-any_of(c("x1", "x_1")), -id)
+
+colnames(train_clean)
+```
+
+## Missing Values Analysis
+
+```{r missing-train}
+# Count missing values per variable in the training set
+train_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_count") %>%
+  arrange(desc(na_count))
+```
+
+```{r missing-train-pct}
+# Missing percentage per variable in the training set
+train_clean %>%
+  summarise(across(everything(), ~ mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_percent") %>%
+  arrange(desc(na_percent))
+```
+
+```{r missing-test}
+# Count missing values per variable in the test set
+test_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_count") %>%
+  arrange(desc(na_count))
+```
+
+```{r missing-test-pct}
+# Missing percentage per variable in the test set
+test_clean %>%
+  summarise(across(everything(), ~ mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_percent") %>%
+  arrange(desc(na_percent))
+```
+
+Missing values are present only in `arrival_delay_in_minutes` — approximately 0.3% of the training set and a similar proportion in the test set. Before deciding on an imputation strategy, we perform a thorough EDA to understand the relationships between `arrival_delay_in_minutes` and all other variables.
+
+# Exploratory Data Analysis
+
+## Target Variable Distribution
+
+```{r target-dist}
+train_clean %>%
+  count(satisfaction) %>%
+  mutate(prop = round(n / sum(n), 3)) %>%
+  kable() %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r target-barplot}
+ggplot(train_clean, aes(x = satisfaction, fill = satisfaction)) +
+  geom_bar(width = 0.6) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = c("neutral or dissatisfied" = "#E74C3C",
+                                "satisfied" = "#2ECC71")) +
+  labs(title = "Distribution of Passenger Satisfaction",
+       x = "Satisfaction", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The classes are reasonably balanced (~43% satisfied, ~57% neutral/dissatisfied), so no resampling techniques are strictly necessary.
+
+## Distributions of Continuous Variables
+
+```{r continuous-dist, fig.height=5}
+train_clean %>%
+  dplyr::select(age, flight_distance,
+                departure_delay_in_minutes, arrival_delay_in_minutes) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.8) +
+  facet_wrap(~ name, scales = "free", ncol = 2) +
+  labs(title = "Distributions of Continuous Variables") +
+  theme_minimal()
+```
+
+```{r delay-tail-analysis}
+# How extreme are the delay tails?
+train_clean %>%
+  dplyr::select(departure_delay_in_minutes, arrival_delay_in_minutes) %>%
+  summarise(across(everything(), list(
+    min    = ~ min(., na.rm = TRUE),
+    p25    = ~ quantile(., 0.25, na.rm = TRUE),
+    median = ~ median(., na.rm = TRUE),
+    p75    = ~ quantile(., 0.75, na.rm = TRUE),
+    p95    = ~ quantile(., 0.95, na.rm = TRUE),
+    p99    = ~ quantile(., 0.99, na.rm = TRUE),
+    max    = ~ max(., na.rm = TRUE)
+  ))) %>%
+  pivot_longer(everything(), names_to = c("variable", "stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = stat, values_from = value)
+```
+
+```{r extreme-counts}
+# How many observations are extreme?
+train_clean %>%
+  summarise(
+    dep_over_120  = sum(departure_delay_in_minutes > 120, na.rm = TRUE),
+    dep_over_300  = sum(departure_delay_in_minutes > 300, na.rm = TRUE),
+    dep_over_500  = sum(departure_delay_in_minutes > 500, na.rm = TRUE),
+    arr_over_120  = sum(arrival_delay_in_minutes > 120, na.rm = TRUE),
+    arr_over_300  = sum(arrival_delay_in_minutes > 300, na.rm = TRUE),
+    arr_over_500  = sum(arrival_delay_in_minutes > 500, na.rm = TRUE)
+  )
+```
+
+```{r extreme-rows}
+# Inspect the actual extreme rows
+train_clean %>%
+  filter(departure_delay_in_minutes > 500) %>%
+  dplyr::select(departure_delay_in_minutes, arrival_delay_in_minutes,
+                flight_distance, class, type_of_travel,
+                departure_arrival_time_convenient) %>%
+  arrange(desc(departure_delay_in_minutes))
+```
+
+## Distributions of Service Ratings (Discrete 0–5 Scale)
+
+```{r rating-dist, fig.height=8}
+rating_vars <- c("inflight_wifi_service", "departure_arrival_time_convenient",
+                  "ease_of_online_booking", "gate_location", "food_and_drink",
+                  "online_boarding", "seat_comfort", "inflight_entertainment",
+                  "on_board_service", "leg_room_service", "baggage_handling",
+                  "checkin_service", "inflight_service", "cleanliness")
+
+train_clean %>%
+  dplyr::select(all_of(rating_vars)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = factor(value))) +
+  geom_bar(fill = "darkorange", alpha = 0.8) +
+  facet_wrap(~ name, scales = "free_y", ncol = 4) +
+  labs(title = "Service Rating Distributions (0–5 Scale)", x = "Rating", y = "Count") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8))
+```
+
+## Categorical Variable Distributions
+
+```{r cat-dist, fig.height=5}
+train_clean %>%
+  dplyr::select(gender, customer_type, type_of_travel, class) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value, fill = value)) +
+  geom_bar(alpha = 0.8) +
+  facet_wrap(~ name, scales = "free", ncol = 2) +
+  labs(title = "Categorical Variable Distributions") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
+```
+
+## Satisfaction by Key Categorical Variables
+
+```{r satisfaction-by-cat, fig.height=8}
+p1 <- train_clean %>%
+  count(class, satisfaction) %>%
+  group_by(class) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = class, y = prop, fill = satisfaction)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Satisfaction by Travel Class", y = "Proportion") +
+  theme_minimal()
+
+p2 <- train_clean %>%
+  count(type_of_travel, satisfaction) %>%
+  group_by(type_of_travel) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = type_of_travel, y = prop, fill = satisfaction)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Satisfaction by Travel Type", y = "Proportion") +
+  theme_minimal()
+
+p3 <- train_clean %>%
+  count(customer_type, satisfaction) %>%
+  group_by(customer_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = customer_type, y = prop, fill = satisfaction)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Satisfaction by Customer Type", y = "Proportion") +
+  theme_minimal()
+
+p4 <- train_clean %>%
+  count(gender, satisfaction) %>%
+  group_by(gender) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = gender, y = prop, fill = satisfaction)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Satisfaction by Gender", y = "Proportion") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+## Age Distribution by Satisfaction
+
+```{r age-dist}
+ggplot(train_clean, aes(x = age, fill = satisfaction)) +
+  geom_histogram(bins = 40, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Age Distribution by Satisfaction", x = "Age", y = "Count") +
+  theme_minimal()
+```
+
+## Boxplots of Service Ratings by Satisfaction
+
+```{r rating-boxplots, fig.height=10}
+train_clean %>%
+  dplyr::select(all_of(rating_vars), satisfaction) %>%
+  pivot_longer(-satisfaction, names_to = "service", values_to = "rating") %>%
+  ggplot(aes(x = satisfaction, y = rating, fill = satisfaction)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ service, ncol = 4) +
+  scale_fill_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "Service Ratings by Satisfaction Level") +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(size = 8))
+```
+
+## Mean Feature Values by Satisfaction Class
+
+```{r mean-by-class}
+train_clean %>%
+  group_by(satisfaction) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+  pivot_longer(-satisfaction) %>%
+  pivot_wider(names_from = satisfaction, values_from = value) %>%
+  mutate(diff = satisfied - `neutral or dissatisfied`) %>%
+  arrange(desc(abs(diff))) %>%
+  kable(digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## Correlation Analysis
+
+```{r corr-numeric}
+# Correlation matrix of all numeric variables
+cor_all <- train_clean %>%
+  dplyr::select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2)
+
+cor_all
+```
+
+```{r corr-heatmap-numeric, fig.height=8, fig.width=10}
+# Heatmap of numeric correlations
+cor_mat_num <- train_clean %>%
+  dplyr::select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs")
+
+corrplot(cor_mat_num, method = "color", type = "upper", order = "hclust",
+         tl.cex = 0.65, tl.col = "black",
+         col = colorRampPalette(c("#2166AC", "white", "#B2182B"))(200),
+         title = "Correlation Matrix — Numeric Variables",
+         mar = c(0, 0, 2, 0))
+```
+
+## Arrival Delay: Relationship with All Other Variables
+
+This subsection is key to justifying our imputation strategy. We examine the relationship between `arrival_delay_in_minutes` and every other variable in the dataset.
+
+### Correlation with Numeric Variables
+
+```{r arrival-delay-corr}
+# Extract the row of correlations for arrival_delay_in_minutes
+arrival_corr <- train_clean %>%
+  dplyr::select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  dplyr::select(variable, r = arrival_delay_in_minutes) %>%
+  filter(variable != "arrival_delay_in_minutes") %>%
+  mutate(abs_r = abs(r)) %>%
+  arrange(desc(abs_r))
+
+arrival_corr %>%
+  kable(digits = 4, col.names = c("Variable", "r (with arrival_delay)", "|r|")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r arrival-delay-corr-plot, fig.height=5}
+ggplot(arrival_corr, aes(x = reorder(variable, abs_r), y = r)) +
+  geom_col(aes(fill = abs_r > 0.1), width = 0.7) +
+  scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "grey70"),
+                    labels = c("TRUE" = "|r| > 0.1", "FALSE" = "|r| ≤ 0.1"),
+                    name = "") +
+  coord_flip() +
+  geom_hline(yintercept = c(-0.1, 0.1), linetype = "dashed", color = "grey40") +
+  labs(title = "Correlation of Arrival Delay with All Other Numeric Variables",
+       subtitle = "Only departure_delay shows a meaningful correlation (r ≈ 0.97); all others are near zero",
+       x = "", y = "Pearson Correlation (r)") +
+  theme_minimal()
+```
+
+```{r arrival-vs-departure-scatter}
+ggplot(train_clean %>% sample_n(5000),
+       aes(departure_delay_in_minutes, arrival_delay_in_minutes)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(title = "Arrival Delay vs Departure Delay",
+       subtitle = paste("Pearson r =",
+                        round(cor(train_clean$departure_delay_in_minutes,
+                                  train_clean$arrival_delay_in_minutes,
+                                  use = "complete.obs"), 4))) +
+  theme_minimal()
+```
+
+The correlation table and bar chart confirm that `departure_delay_in_minutes` is the only variable with a meaningful linear association with `arrival_delay_in_minutes` (r ≈ 0.97). All remaining numeric variables have correlations effectively equal to zero (|r| < 0.05), providing no useful information for predicting missing arrival delays.
+
+### Association with Categorical Variables
+
+We now test whether `arrival_delay_in_minutes` differs across the levels of each categorical variable using both visual (boxplots) and formal statistical tests (Kruskal-Wallis, chosen because the delay distributions are heavily right-skewed and violate the normality assumption of ANOVA).
+
+```{r arrival-delay-boxplots-cat}
+train_clean %>%
+  dplyr::select(arrival_delay_in_minutes, satisfaction, gender,
+                customer_type, type_of_travel, class) %>%
+  pivot_longer(-arrival_delay_in_minutes,
+               names_to = "variable", values_to = "category") %>%
+  ggplot(aes(x = category, y = arrival_delay_in_minutes, fill = category)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ variable, scales = "free_x") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Arrival Delay by Categorical Variables")
+```
+
+```{r arrival-delay-boxplots-zoomed}
+# Zoomed-in version (capped at 180 min) to see the bulk of the distribution
+train_clean %>%
+  dplyr::select(arrival_delay_in_minutes, satisfaction, gender,
+                customer_type, type_of_travel, class) %>%
+  pivot_longer(-arrival_delay_in_minutes,
+               names_to = "variable", values_to = "category") %>%
+  ggplot(aes(x = category, y = arrival_delay_in_minutes, fill = category)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  facet_wrap(~ variable, scales = "free_x") +
+  coord_cartesian(ylim = c(0, 180)) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Arrival Delay by Categorical Variables (Zoomed to 0–180 min)",
+       y = "Arrival Delay (minutes)", x = "")
+```
+
+```{r arrival-delay-mean-by-cat}
+# Mean and median arrival delay per categorical group
+cat_vars <- c("satisfaction", "gender", "customer_type", "type_of_travel", "class")
+
+for (v in cat_vars) {
+  cat("\n── Mean arrival delay by", v, "──\n")
+  train_clean %>%
+    group_by(.data[[v]]) %>%
+    summarise(
+      mean_delay = mean(arrival_delay_in_minutes, na.rm = TRUE),
+      median_delay = median(arrival_delay_in_minutes, na.rm = TRUE),
+      n = n()
+    ) %>%
+    print()
+}
+```
+
+```{r arrival-delay-kruskal}
+# Formal tests of association: Kruskal-Wallis for each categorical variable
+# (non-parametric alternative to one-way ANOVA, appropriate for skewed distributions)
+kruskal_results <- tibble(
+  Variable = cat_vars,
+  Statistic = NA_real_,
+  p_value = NA_real_
+)
+
+for (i in seq_along(cat_vars)) {
+  v <- cat_vars[i]
+  test <- kruskal.test(
+    arrival_delay_in_minutes ~ as.factor(.data[[v]]),
+    data = train_clean %>% filter(!is.na(arrival_delay_in_minutes))
+  )
+  kruskal_results$Statistic[i] <- test$statistic
+  kruskal_results$p_value[i]   <- test$p.value
+}
+
+kruskal_results %>%
+  mutate(
+    Significant = ifelse(p_value < 0.05, "Yes", "No"),
+    Effect = "Negligible (see means above)"
+  ) %>%
+  kable(digits = 4, col.names = c("Categorical Variable", "Kruskal-Wallis H",
+                                    "p-value", "Significant (α=0.05)", "Practical Effect")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Although some Kruskal-Wallis tests may reach statistical significance (due to the very large sample size, n ≈ 100,000, even trivial differences become "significant"), the practical differences in mean and median arrival delay across groups are negligible — typically less than 1 minute. The boxplots confirm that the distributions are virtually identical across all categorical levels.
+
+### Imputation Justification — Summary
+
+Taken together, this analysis shows that:
+
+1. **Departure delay** is the only variable with a meaningful relationship with arrival delay (r ≈ 0.97, a near-perfect linear association).
+2. All other **numeric variables** have correlations effectively equal to zero (|r| < 0.05).
+3. The **categorical variables** show no practically meaningful differences in arrival delay across their levels, despite some tests reaching statistical significance due to the large sample size.
+
+Therefore, a simple linear regression model using `departure_delay_in_minutes` as the sole predictor is the most appropriate and parsimonious imputation strategy. Including additional covariates would add no predictive value.
+
+# Missing Value Imputation
+
+We fit a simple linear regression of arrival delay on departure delay using the complete cases in the training data, then use it to impute missing values in both sets. The model is fitted on the training set only to prevent data leakage.
+
+```{r imputation-model}
+delay_model <- lm(arrival_delay_in_minutes ~ departure_delay_in_minutes,
+                  data = train_clean,
+                  na.action = na.exclude)
+
+summary(delay_model)
+```
+
+```{r keep-raw-versions}
+# Keep versions with missing values for reference
+train_with_na <- train_clean
+test_with_na  <- test_clean
+```
+
+```{r apply-imputation}
+# Impute missing values using the fitted model
+train_clean$arrival_delay_in_minutes[is.na(train_clean$arrival_delay_in_minutes)] <-
+  predict(delay_model,
+          newdata = train_clean[is.na(train_clean$arrival_delay_in_minutes), ])
+
+test_clean$arrival_delay_in_minutes[is.na(test_clean$arrival_delay_in_minutes)] <-
+  predict(delay_model,
+          newdata = test_clean[is.na(test_clean$arrival_delay_in_minutes), ])
+
+cat("Remaining NAs in train:", sum(is.na(train_clean$arrival_delay_in_minutes)), "\n")
+cat("Remaining NAs in test:", sum(is.na(test_clean$arrival_delay_in_minutes)), "\n")
+```
+
+# Encoding Categorical Variables as Factors
+
+We encode the categorical variables as factors with specified levels. The response variable `satisfaction` is set with "neutral or dissatisfied" as the reference level.
+
+```{r encoding}
+encode_factors <- function(df) {
+  df %>%
+    mutate(
+      satisfaction = factor(satisfaction,
+                            levels = c("neutral or dissatisfied", "satisfied")),
+      gender = factor(gender),
+      customer_type = factor(customer_type),
+      type_of_travel = factor(type_of_travel),
+      class = factor(class, levels = c("Eco", "Eco Plus", "Business"))
+    )
+}
+
+train <- encode_factors(train_clean)
+test  <- encode_factors(test_clean)
+
+str(train[, c("gender", "customer_type", "type_of_travel", "class", "satisfaction")])
+```
+
+## Summary of Data Versions
+
+At this point we maintain three versions of the data:
+
+- **`train_raw` / `test_raw`**: original CSV data with all columns and missing values
+- **`train_with_na` / `test_with_na`**: cleaned (removed id columns, snake_case names) but still with missing values in `arrival_delay_in_minutes`
+- **`train` / `test`**: cleaned, imputed, and factor-encoded — ready for modelling
+
+# Logistic Regression
+
+## Data Preparation
+
+```{r model-prep}
+# Verify no NAs remain
+cat("Any NAs in train?", any(is.na(train)), "\n")
+cat("Any NAs in test?", any(is.na(test)), "\n")
+
+train_y <- train$satisfaction
+test_y  <- test$satisfaction
+```
+
+## Model Fitting
+
+We fit a logistic regression model with all available predictors. The `glm()` function with `family = binomial` estimates the probability of satisfaction as a function of the predictors via the logit link:
+
+$$\log\left(\frac{P(Y = \text{satisfied} \mid X)}{1 - P(Y = \text{satisfied} \mid X)}\right) = \beta_0 + \beta_1 X_1 + \cdots + \beta_p X_p$$
+
+```{r glm-fit}
+glm_fit <- glm(satisfaction ~ ., data = train, family = binomial)
+summary(glm_fit)
+```
+
+## Interpretation — Odds Ratios
+
+The exponentiated coefficients give odds ratios: the multiplicative change in the odds of being satisfied per unit increase in each predictor.
+
+```{r glm-odds-ratios}
+glm_or <- exp(cbind(OR = coef(glm_fit), confint.default(glm_fit)))
+glm_or %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable != "(Intercept)") %>%
+  arrange(desc(abs(OR - 1))) %>%
+  head(15) %>%
+  kable(digits = 3) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Variables with OR > 1 increase the odds of satisfaction; OR < 1 decrease it. Key drivers of satisfaction include online boarding, type of travel, inflight entertainment, seat comfort, and travel class.
+
+## Predictions and Confusion Matrix
+
+```{r glm-predict}
+glm_probs <- predict(glm_fit, newdata = test, type = "response")
+glm_pred <- ifelse(glm_probs > 0.5, "satisfied", "neutral or dissatisfied")
+glm_pred <- factor(glm_pred, levels = levels(test_y))
+
+glm_cm <- confusionMatrix(glm_pred, test_y, positive = "satisfied")
+glm_cm
+```
+
+```{r glm-cm-plot, fig.height=5, fig.width=6}
+cm_df <- as.data.frame(glm_cm$table)
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Logistic Regression — Confusion Matrix") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## ROC Curve and AUC
+
+```{r glm-roc, fig.height=6}
+roc_glm <- roc(test_y, glm_probs,
+               levels = c("neutral or dissatisfied", "satisfied"))
+
+plot(roc_glm, col = "#E74C3C", lwd = 2,
+     main = "ROC Curve — Logistic Regression")
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = paste0("AUC = ", round(auc(roc_glm), 4)),
+       col = "#E74C3C", lwd = 2)
+
+cat("AUC:", round(auc(roc_glm), 4), "\n")
+```
+
+## Summary Metrics
+
+```{r glm-summary}
+tibble(
+  Metric = c("Accuracy", "Sensitivity", "Specificity",
+             "Balanced Accuracy", "Kappa", "F1 Score", "AUC"),
+  Value = c(
+    glm_cm$overall["Accuracy"],
+    glm_cm$byClass["Sensitivity"],
+    glm_cm$byClass["Specificity"],
+    glm_cm$byClass["Balanced Accuracy"],
+    glm_cm$overall["Kappa"],
+    glm_cm$byClass["F1"],
+    as.numeric(auc(roc_glm))
+  )
+) %>%
+  kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```
