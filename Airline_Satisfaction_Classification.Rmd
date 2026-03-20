@@ -359,10 +359,6 @@ arrival_corr <- train_clean %>%
   filter(variable != "arrival_delay_in_minutes") %>%
   mutate(abs_r = abs(r)) %>%
   arrange(desc(abs_r))
-
-arrival_corr %>%
-  kable(digits = 4, col.names = c("Variable", "r (with arrival_delay)", "|r|")) %>%
-  kable_styling(bootstrap_options = "striped", full_width = FALSE)
 ```
 
 ```{r arrival-delay-corr-plot, fig.height=5}
