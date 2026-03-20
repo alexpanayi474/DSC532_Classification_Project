@@ -26,7 +26,8 @@ knitr::opts_chunk$set(
 ```{r libraries}
 # Install packages if needed (uncomment on first run)
 # install.packages(c("tidyverse", "janitor", "skimr", "corrplot", "caret",
-#                     "MASS", "pROC", "knitr", "kableExtra", "gridExtra"))
+#                     "MASS", "class", "e1071", "glmnet", "pROC",
+#                     "knitr", "kableExtra", "gridExtra"))
 
 library(tidyverse)
 library(janitor)
@@ -515,86 +516,536 @@ At this point we maintain three versions of the data:
 - **`train_with_na` / `test_with_na`**: cleaned (removed id columns, snake_case names) but still with missing values in `arrival_delay_in_minutes`
 - **`train` / `test`**: cleaned, imputed, and factor-encoded — ready for modelling
 
-# Logistic Regression
+# Classification Modelling
 
-## Data Preparation
+## Train / Validation Split
 
-```{r model-prep}
-# Verify no NAs remain
-cat("Any NAs in train?", any(is.na(train)), "\n")
-cat("Any NAs in test?", any(is.na(test)), "\n")
+We hold out the provided test set for **final evaluation only**. All model selection, tuning and comparison is done on a validation set carved from the training data (80/20 stratified split).
 
-train_y <- train$satisfaction
+```{r train-val-split}
+library(class)
+library(e1071)
+library(glmnet)
+
+set.seed(42)
+val_idx <- createDataPartition(train$satisfaction, p = 0.2, list = FALSE)
+val_set   <- train[val_idx, ]
+train_set <- train[-val_idx, ]
+
+cat("Training set:", nrow(train_set), "rows\n")
+cat("Validation set:", nrow(val_set), "rows\n")
+cat("Test set (held out):", nrow(test), "rows\n")
+
+train_y <- train_set$satisfaction
+val_y   <- val_set$satisfaction
 test_y  <- test$satisfaction
 ```
 
-## Model Fitting
+```{r helper-metrics}
+extract_metrics <- function(cm, roc_obj, name) {
+  tibble(
+    Model = name,
+    Accuracy    = cm$overall["Accuracy"],
+    Precision   = cm$byClass["Pos Pred Value"],
+    Recall      = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    `F1 Score`  = cm$byClass["F1"],
+    AUC         = as.numeric(auc(roc_obj))
+  )
+}
 
-We fit a logistic regression model with all available predictors. The `glm()` function with `family = binomial` estimates the probability of satisfaction as a function of the predictors via the logit link:
+plot_cm <- function(cm, title) {
+  cm_df <- as.data.frame(cm$table)
+  ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    labs(title = title) + theme_minimal() + theme(legend.position = "none")
+}
+```
+
+# Initial Model Comparison — Full Features
+
+We fit five classification methods on the full feature set and evaluate on the validation set to identify the best performers.
+
+## 1. Logistic Regression
 
 $$\log\left(\frac{P(Y = \text{satisfied} \mid X)}{1 - P(Y = \text{satisfied} \mid X)}\right) = \beta_0 + \beta_1 X_1 + \cdots + \beta_p X_p$$
 
 ```{r glm-fit}
-glm_fit <- glm(satisfaction ~ ., data = train, family = binomial)
+glm_fit <- glm(satisfaction ~ ., data = train_set, family = binomial)
 summary(glm_fit)
 ```
-# Interpretation:...
 
-## Predictions and Confusion Matrix
-
-```{r glm-predict}
-glm_probs <- predict(glm_fit, newdata = test, type = "response")
-glm_pred <- ifelse(glm_probs > 0.5, "satisfied", "neutral or dissatisfied")
-glm_pred <- factor(glm_pred, levels = levels(test_y))
-
-glm_cm <- confusionMatrix(glm_pred, test_y, positive = "satisfied")
+```{r glm-val}
+glm_probs_val <- predict(glm_fit, newdata = val_set, type = "response")
+glm_pred_val  <- factor(ifelse(glm_probs_val > 0.5, "satisfied",
+                                "neutral or dissatisfied"), levels = levels(val_y))
+glm_cm <- confusionMatrix(glm_pred_val, val_y, positive = "satisfied")
 glm_cm
 ```
 
-```{r glm-cm-plot, fig.height=5, fig.width=6}
-cm_df <- as.data.frame(glm_cm$table)
-ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
-  geom_tile(color = "white") +
-  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
-  scale_fill_gradient(low = "white", high = "steelblue") +
-  labs(title = "Logistic Regression — Confusion Matrix") +
-  theme_minimal() +
-  theme(legend.position = "none")
+## 2. LDA
+
+```{r lda-fit}
+lda_fit <- lda(satisfaction ~ ., data = train_set)
+lda_pred_obj  <- predict(lda_fit, newdata = val_set)
+lda_pred_val  <- lda_pred_obj$class
+lda_probs_val <- lda_pred_obj$posterior[, "satisfied"]
+lda_cm <- confusionMatrix(lda_pred_val, val_y, positive = "satisfied")
+lda_cm
 ```
 
-## ROC Curve and AUC
+## 3. QDA
 
-```{r glm-roc, fig.height=6}
-roc_glm <- roc(test_y, glm_probs,
-               levels = c("neutral or dissatisfied", "satisfied"))
+```{r qda-fit}
+qda_fit <- qda(satisfaction ~ ., data = train_set)
+qda_pred_obj  <- predict(qda_fit, newdata = val_set)
+qda_pred_val  <- qda_pred_obj$class
+qda_probs_val <- qda_pred_obj$posterior[, "satisfied"]
+qda_cm <- confusionMatrix(qda_pred_val, val_y, positive = "satisfied")
+qda_cm
+```
 
-plot(roc_glm, col = "#E74C3C", lwd = 2,
-     main = "ROC Curve — Logistic Regression")
+## 4. Naive Bayes
+
+```{r nb-fit}
+nb_fit <- naiveBayes(satisfaction ~ ., data = train_set)
+nb_pred_val  <- predict(nb_fit, newdata = val_set)
+nb_probs_val <- predict(nb_fit, newdata = val_set, type = "raw")[, "satisfied"]
+nb_cm <- confusionMatrix(nb_pred_val, val_y, positive = "satisfied")
+nb_cm
+```
+
+## 5. KNN (K = 5)
+
+```{r knn-fit}
+train_x_knn <- model.matrix(satisfaction ~ . - 1, data = train_set)
+val_x_knn   <- model.matrix(satisfaction ~ . - 1, data = val_set)
+train_x_scaled <- scale(train_x_knn)
+val_x_scaled   <- scale(val_x_knn,
+                         center = attr(train_x_scaled, "scaled:center"),
+                         scale  = attr(train_x_scaled, "scaled:scale"))
+
+set.seed(42)
+knn_pred_val <- knn(train = train_x_scaled, test = val_x_scaled,
+                     cl = train_y, k = 5, prob = TRUE)
+knn_prob_raw  <- attr(knn_pred_val, "prob")
+knn_probs_val <- ifelse(knn_pred_val == "satisfied", knn_prob_raw, 1 - knn_prob_raw)
+knn_cm <- confusionMatrix(knn_pred_val, val_y, positive = "satisfied")
+knn_cm
+```
+
+## Comparison — All 5 Models
+
+```{r roc-init}
+roc_glm <- roc(val_y, glm_probs_val, levels = c("neutral or dissatisfied", "satisfied"))
+roc_lda <- roc(val_y, lda_probs_val, levels = c("neutral or dissatisfied", "satisfied"))
+roc_qda <- roc(val_y, qda_probs_val, levels = c("neutral or dissatisfied", "satisfied"))
+roc_nb  <- roc(val_y, nb_probs_val,  levels = c("neutral or dissatisfied", "satisfied"))
+roc_knn <- roc(val_y, knn_probs_val, levels = c("neutral or dissatisfied", "satisfied"))
+
+comparison_init <- bind_rows(
+  extract_metrics(glm_cm, roc_glm, "Logistic Regression"),
+  extract_metrics(lda_cm, roc_lda, "LDA"),
+  extract_metrics(qda_cm, roc_qda, "QDA"),
+  extract_metrics(nb_cm,  roc_nb,  "Naive Bayes"),
+  extract_metrics(knn_cm, roc_knn, "KNN (K=5)")
+)
+
+comparison_init %>% arrange(desc(AUC)) %>%
+  kable(digits = 4) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r roc-curves-init, fig.height=7}
+plot(roc_glm, col = "#E74C3C", lwd = 2, main = "ROC Curves — Initial Models (Validation Set)")
+plot(roc_lda, col = "#3498DB", lwd = 2, add = TRUE)
+plot(roc_qda, col = "#2ECC71", lwd = 2, add = TRUE)
+plot(roc_nb,  col = "#F39C12", lwd = 2, add = TRUE)
+plot(roc_knn, col = "#9B59B6", lwd = 2, add = TRUE)
 abline(a = 0, b = 1, lty = 2, col = "grey50")
 legend("bottomright",
-       legend = paste0("AUC = ", round(auc(roc_glm), 4)),
-       col = "#E74C3C", lwd = 2)
-
-cat("AUC:", round(auc(roc_glm), 4), "\n")
+       legend = c(paste0("Logistic (AUC=", round(auc(roc_glm), 4), ")"),
+                  paste0("LDA (AUC=", round(auc(roc_lda), 4), ")"),
+                  paste0("QDA (AUC=", round(auc(roc_qda), 4), ")"),
+                  paste0("NB (AUC=", round(auc(roc_nb), 4), ")"),
+                  paste0("KNN (AUC=", round(auc(roc_knn), 4), ")")),
+       col = c("#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6"),
+       lwd = 2, cex = 0.85)
 ```
 
-## Summary Metrics
+```{r cm-heatmaps-init, fig.height=10, fig.width=12}
+grid.arrange(
+  plot_cm(glm_cm, "Logistic Regression"), plot_cm(lda_cm, "LDA"),
+  plot_cm(qda_cm, "QDA"), plot_cm(nb_cm, "Naive Bayes"),
+  plot_cm(knn_cm, "KNN (K=5)"), ncol = 3)
+```
 
-```{r glm-summary}
-tibble(
-  Metric = c("Accuracy", "Sensitivity", "Specificity",
-             "Balanced Accuracy", "Kappa", "F1 Score", "AUC"),
-  Value = c(
-    glm_cm$overall["Accuracy"],
-    glm_cm$byClass["Sensitivity"],
-    glm_cm$byClass["Specificity"],
-    glm_cm$byClass["Balanced Accuracy"],
-    glm_cm$overall["Kappa"],
-    glm_cm$byClass["F1"],
-    as.numeric(auc(roc_glm))
-  )
+**Finding:** Logistic Regression and KNN are the top two performers. We proceed with these (plus LDA and QDA for comparison on reduced feature sets).
+
+# Feature Selection via LASSO (L1 Regularisation)
+
+LASSO adds an L1 penalty $\lambda \sum_{j=1}^{p} |\beta_j|$ to the logistic regression likelihood. As $\lambda$ increases, coefficients shrink toward zero and some are set exactly to zero, performing automatic feature selection.
+
+```{r lasso-prep}
+x_train <- model.matrix(satisfaction ~ . - 1, data = train_set)
+y_train <- ifelse(train_set$satisfaction == "satisfied", 1, 0)
+x_val   <- model.matrix(satisfaction ~ . - 1, data = val_set)
+```
+
+```{r lasso-cv, fig.height=5}
+set.seed(42)
+lasso_cv <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = 10)
+plot(lasso_cv, main = "LASSO CV: Deviance vs log(λ)")
+cat("λ_min:", round(lasso_cv$lambda.min, 6), "\n")
+cat("λ_1se:", round(lasso_cv$lambda.1se, 6), "\n")
+```
+
+```{r lasso-lambdas}
+lambda_values <- c(0.001, 0.01, 0.1, lasso_cv$lambda.min, lasso_cv$lambda.1se)
+lambda_names  <- c("λ=0.001", "λ=0.01", "λ=0.1",
+                    paste0("λ_min=", round(lasso_cv$lambda.min, 5)),
+                    paste0("λ_1se=", round(lasso_cv$lambda.1se, 5)))
+
+lasso_results <- tibble()
+for (i in seq_along(lambda_values)) {
+  lam <- lambda_values[i]
+  fit_i <- glmnet(x_train, y_train, family = "binomial", alpha = 1, lambda = lam)
+  n_nz  <- sum(coef(fit_i)[-1, ] != 0)
+  probs <- predict(fit_i, newx = x_val, type = "response")[, 1]
+  pred  <- factor(ifelse(probs > 0.5, "satisfied", "neutral or dissatisfied"),
+                   levels = levels(val_y))
+  cm_i  <- confusionMatrix(pred, val_y, positive = "satisfied")
+  roc_i <- roc(val_y, probs, levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+  lasso_results <- bind_rows(lasso_results, tibble(
+    Lambda = lambda_names[i], `Non-zero` = n_nz,
+    Accuracy = cm_i$overall["Accuracy"], `F1 Score` = cm_i$byClass["F1"],
+    AUC = as.numeric(auc(roc_i))))
+}
+
+lasso_results %>% kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+**Choosing λ_1se:** The 1-SE rule model uses 17 features with only a negligible drop in F1/AUC compared to λ_min. Given the bias–variance trade-off, the more parsimonious model is preferred — it reduces overfitting risk and improves interpretability.
+
+```{r lasso-1se-coefs}
+lasso_1se <- glmnet(x_train, y_train, family = "binomial",
+                     alpha = 1, lambda = lasso_cv$lambda.1se)
+lasso_coefs <- as.matrix(coef(lasso_1se))
+lasso_coefs_df <- data.frame(
+  Variable = rownames(lasso_coefs), Coefficient = lasso_coefs[, 1]
 ) %>%
-  kable(digits = 4) %>%
+  filter(Variable != "(Intercept)", Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+
+cat("Features selected by LASSO (λ_1se):", nrow(lasso_coefs_df),
+    "out of", ncol(x_train), "\n\n")
+lasso_coefs_df %>% kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r lasso-coef-plot, fig.height=6}
+ggplot(lasso_coefs_df, aes(x = reorder(Variable, abs(Coefficient)), y = Coefficient)) +
+  geom_col(aes(fill = Coefficient > 0), width = 0.7) +
+  scale_fill_manual(values = c("TRUE" = "#2ECC71", "FALSE" = "#E74C3C"),
+                    labels = c("Negative", "Positive"), name = "Direction") +
+  coord_flip() +
+  labs(title = "LASSO Coefficients (λ_1se — 17 features)",
+       x = "", y = "Coefficient") +
+  theme_minimal()
+```
+
+## Refitting LDA, QDA and KNN on LASSO-Selected Features
+
+We use the 17 features identified by LASSO (λ_1se) and refit the other classifiers to see whether the reduced feature set maintains or improves performance.
+
+```{r lasso-selected-vars}
+# Extract the selected column names from the model matrix
+selected_cols <- lasso_coefs_df$Variable
+
+# Build reduced model matrices using only LASSO-selected columns
+train_x_reduced <- x_train[, selected_cols, drop = FALSE]
+val_x_reduced   <- x_val[, selected_cols, drop = FALSE]
+
+# Also build a formula-friendly data frame for LDA/QDA
+# Map one-hot columns back to original variable names
+original_vars <- unique(gsub("(Eco Plus|Business|Male|Loyal Customer|Business travel)", "",
+                              selected_cols))
+# Safer: extract base variable names from model matrix column names
+all_model_vars <- attr(terms(satisfaction ~ ., data = train_set), "term.labels")
+selected_base_vars <- unique(sapply(selected_cols, function(col) {
+  matches <- sapply(all_model_vars, function(v) startsWith(col, v))
+  if (any(matches)) all_model_vars[which(matches)[1]] else col
+}))
+
+lasso_formula <- reformulate(selected_base_vars, response = "satisfaction")
+cat("Reduced formula:\n"); print(lasso_formula)
+```
+
+```{r lasso-lda-qda}
+# LDA on reduced features
+lda_red <- lda(lasso_formula, data = train_set)
+lda_red_obj   <- predict(lda_red, newdata = val_set)
+lda_red_pred  <- lda_red_obj$class
+lda_red_probs <- lda_red_obj$posterior[, "satisfied"]
+lda_red_cm  <- confusionMatrix(lda_red_pred, val_y, positive = "satisfied")
+roc_lda_red <- roc(val_y, lda_red_probs,
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+
+# QDA on reduced features
+qda_red <- qda(lasso_formula, data = train_set)
+qda_red_obj   <- predict(qda_red, newdata = val_set)
+qda_red_pred  <- qda_red_obj$class
+qda_red_probs <- qda_red_obj$posterior[, "satisfied"]
+qda_red_cm  <- confusionMatrix(qda_red_pred, val_y, positive = "satisfied")
+roc_qda_red <- roc(val_y, qda_red_probs,
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+```
+
+```{r lasso-knn}
+# KNN on reduced (scaled) model matrix
+train_x_red_sc <- scale(train_x_reduced)
+val_x_red_sc   <- scale(val_x_reduced,
+                          center = attr(train_x_red_sc, "scaled:center"),
+                          scale  = attr(train_x_red_sc, "scaled:scale"))
+
+set.seed(42)
+knn_red_pred <- knn(train_x_red_sc, val_x_red_sc, cl = train_y, k = 5, prob = TRUE)
+knn_red_prob_raw  <- attr(knn_red_pred, "prob")
+knn_red_probs     <- ifelse(knn_red_pred == "satisfied", knn_red_prob_raw, 1 - knn_red_prob_raw)
+knn_red_cm  <- confusionMatrix(knn_red_pred, val_y, positive = "satisfied")
+roc_knn_red <- roc(val_y, knn_red_probs,
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+```
+
+```{r lasso-reduced-comparison}
+# LASSO logistic regression prediction (λ_1se) for the table
+lasso_1se_probs <- predict(lasso_1se, newx = x_val, type = "response")[, 1]
+lasso_1se_pred  <- factor(ifelse(lasso_1se_probs > 0.5, "satisfied",
+                                  "neutral or dissatisfied"), levels = levels(val_y))
+lasso_1se_cm  <- confusionMatrix(lasso_1se_pred, val_y, positive = "satisfied")
+roc_lasso_1se <- roc(val_y, lasso_1se_probs,
+                      levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+
+reduced_comparison <- bind_rows(
+  extract_metrics(lasso_1se_cm, roc_lasso_1se, "Logistic LASSO (17 feat.)"),
+  extract_metrics(lda_red_cm,   roc_lda_red,   "LDA (17 feat.)"),
+  extract_metrics(qda_red_cm,   roc_qda_red,   "QDA (17 feat.)"),
+  extract_metrics(knn_red_cm,   roc_knn_red,   "KNN K=5 (17 feat.)")
+)
+
+bind_rows(
+  comparison_init %>% mutate(Features = "Full (22)"),
+  reduced_comparison %>% mutate(Features = "LASSO (17)")
+) %>%
+  arrange(desc(AUC)) %>%
+  kable(digits = 4) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+# Cross-Validation — Top 2 Models
+
+We perform 10-fold CV only on Logistic Regression and KNN (the top performers), including KNN hyperparameter tuning.
+
+```{r cv-setup}
+ctrl <- trainControl(method = "cv", number = 10, classProbs = TRUE,
+                     summaryFunction = twoClassSummary, savePredictions = "final")
+train_caret <- train_set %>%
+  mutate(satisfaction = factor(ifelse(satisfaction == "satisfied",
+                                       "satisfied", "dissatisfied")))
+```
+
+```{r cv-glm}
+cv_glm <- train(satisfaction ~ ., data = train_caret,
+                method = "glm", family = "binomial",
+                trControl = ctrl, metric = "ROC")
+cv_glm$results %>% kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r cv-knn, fig.height=5}
+knn_grid <- expand.grid(k = c(1, 3, 5, 7, 9, 11, 15, 21, 31, 51))
+cv_knn <- train(satisfaction ~ ., data = train_caret,
+                method = "knn", trControl = ctrl, tuneGrid = knn_grid,
+                preProcess = c("center", "scale"), metric = "ROC")
+
+plot(cv_knn, main = "KNN: CV ROC vs K")
+cat("Optimal K:", cv_knn$bestTune$k, "\n")
+cv_knn$results %>% kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r cv-comparison}
+cv_results <- resamples(list(Logistic = cv_glm, KNN = cv_knn))
+summary(cv_results)
+```
+
+```{r cv-plots, fig.height=5}
+dotplot(cv_results, main = "10-Fold CV: Logistic vs KNN")
+```
+
+# Dimensionality Reduction — PCA
+
+We apply PCA to the numeric features and refit the top models (Logistic, KNN, LDA) on the reduced data to test whether dimensionality reduction helps.
+
+```{r pca-fit}
+numeric_vars <- train_set %>% dplyr::select(where(is.numeric)) %>% names()
+pca_fit <- prcomp(train_set[, numeric_vars], center = TRUE, scale. = TRUE)
+
+pca_var <- tibble(
+  PC = paste0("PC", 1:length(pca_fit$sdev)),
+  `Prop. Explained` = pca_fit$sdev^2 / sum(pca_fit$sdev^2),
+  Cumulative = cumsum(pca_fit$sdev^2 / sum(pca_fit$sdev^2))
+)
+pca_var %>% head(15) %>% kable(digits = 4) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r pca-screeplot, fig.height=5}
+p_scree <- ggplot(pca_var, aes(x = 1:nrow(pca_var), y = `Prop. Explained`)) +
+  geom_line(color = "steelblue", linewidth = 1) + geom_point(color = "steelblue", size = 2) +
+  labs(title = "Scree Plot", x = "PC", y = "Proportion of Variance") + theme_minimal()
+p_cumul <- ggplot(pca_var, aes(x = 1:nrow(pca_var), y = Cumulative)) +
+  geom_line(color = "#E74C3C", linewidth = 1) + geom_point(color = "#E74C3C", size = 2) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "grey50") +
+  labs(title = "Cumulative Variance", x = "PC", y = "Cumulative") + theme_minimal()
+grid.arrange(p_scree, p_cumul, ncol = 2)
+```
+
+```{r pca-biplot, fig.height=6}
+pca_scores <- as.data.frame(pca_fit$x[, 1:2])
+pca_scores$satisfaction <- train_set$satisfaction
+ggplot(pca_scores %>% sample_n(min(5000, nrow(pca_scores))),
+       aes(x = PC1, y = PC2, color = satisfaction)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  scale_color_manual(values = c("#E74C3C", "#2ECC71")) +
+  labs(title = "PCA — First Two Principal Components") + theme_minimal()
+```
+
+```{r pca-models}
+n_pcs <- which(pca_var$Cumulative >= 0.90)[1]
+cat("PCs for 90% variance:", n_pcs, "\n")
+
+train_pca <- as.data.frame(pca_fit$x[, 1:n_pcs])
+train_pca$satisfaction <- train_set$satisfaction
+val_pca <- as.data.frame(predict(pca_fit, newdata = val_set[, numeric_vars])[, 1:n_pcs])
+val_pca$satisfaction <- val_set$satisfaction
+
+# Logistic on PCA
+glm_pca <- glm(satisfaction ~ ., data = train_pca, family = binomial)
+glm_pca_probs <- predict(glm_pca, newdata = val_pca, type = "response")
+glm_pca_pred  <- factor(ifelse(glm_pca_probs > 0.5, "satisfied",
+                                "neutral or dissatisfied"), levels = levels(val_y))
+glm_pca_cm  <- confusionMatrix(glm_pca_pred, val_y, positive = "satisfied")
+roc_glm_pca <- roc(val_y, glm_pca_probs,
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+
+# LDA on PCA
+lda_pca <- lda(satisfaction ~ ., data = train_pca)
+lda_pca_obj <- predict(lda_pca, newdata = val_pca)
+lda_pca_cm  <- confusionMatrix(lda_pca_obj$class, val_y, positive = "satisfied")
+roc_lda_pca <- roc(val_y, lda_pca_obj$posterior[, "satisfied"],
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+
+# KNN on PCA
+best_k <- cv_knn$bestTune$k
+train_pca_sc <- scale(train_pca[, -ncol(train_pca)])
+val_pca_sc   <- scale(val_pca[, -ncol(val_pca)],
+                       center = attr(train_pca_sc, "scaled:center"),
+                       scale  = attr(train_pca_sc, "scaled:scale"))
+knn_pca_pred <- knn(train_pca_sc, val_pca_sc, cl = train_y, k = best_k, prob = TRUE)
+knn_pca_probs <- ifelse(knn_pca_pred == "satisfied",
+                         attr(knn_pca_pred, "prob"), 1 - attr(knn_pca_pred, "prob"))
+knn_pca_cm  <- confusionMatrix(knn_pca_pred, val_y, positive = "satisfied")
+roc_knn_pca <- roc(val_y, knn_pca_probs,
+                    levels = c("neutral or dissatisfied", "satisfied"), quiet = TRUE)
+```
+
+```{r pca-comparison}
+pca_comparison <- bind_rows(
+  extract_metrics(glm_pca_cm, roc_glm_pca, "Logistic (PCA)"),
+  extract_metrics(lda_pca_cm, roc_lda_pca, "LDA (PCA)"),
+  extract_metrics(knn_pca_cm, roc_knn_pca, paste0("KNN K=", best_k, " (PCA)"))
+)
+
+bind_rows(
+  comparison_init %>% filter(Model %in% c("Logistic Regression", "LDA", "KNN (K=5)")) %>%
+    mutate(Features = "Full (22)"),
+  reduced_comparison %>% filter(grepl("Logistic|LDA|KNN", Model)) %>%
+    mutate(Features = "LASSO (17)"),
+  pca_comparison %>% mutate(Features = paste0("PCA (", n_pcs, " PCs)"))
+) %>%
+  arrange(desc(AUC)) %>%
+  kable(digits = 4) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r pca-roc, fig.height=7}
+plot(roc_glm, col = "#E74C3C", lwd = 2, lty = 1,
+     main = "ROC: Full vs LASSO vs PCA (Validation Set)")
+plot(roc_knn, col = "#9B59B6", lwd = 2, lty = 1, add = TRUE)
+plot(roc_lasso_1se, col = "#E74C3C", lwd = 2, lty = 2, add = TRUE)
+plot(roc_knn_red, col = "#9B59B6", lwd = 2, lty = 2, add = TRUE)
+plot(roc_glm_pca, col = "#E74C3C", lwd = 2, lty = 3, add = TRUE)
+plot(roc_knn_pca, col = "#9B59B6", lwd = 2, lty = 3, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = c(paste0("Logistic Full (", round(auc(roc_glm), 3), ")"),
+                  paste0("KNN Full (", round(auc(roc_knn), 3), ")"),
+                  paste0("Logistic LASSO (", round(auc(roc_lasso_1se), 3), ")"),
+                  paste0("KNN LASSO (", round(auc(roc_knn_red), 3), ")"),
+                  paste0("Logistic PCA (", round(auc(roc_glm_pca), 3), ")"),
+                  paste0("KNN PCA (", round(auc(roc_knn_pca), 3), ")")),
+       col = c("#E74C3C", "#9B59B6", "#E74C3C", "#9B59B6", "#E74C3C", "#9B59B6"),
+       lty = c(1, 1, 2, 2, 3, 3), lwd = 2, cex = 0.75)
+```
+
+# Final Evaluation on Test Set
+
+Based on all comparisons above we select the best model configuration and evaluate it **once** on the held-out test set. The model is refitted on the **full training data** (train_set + val_set) to maximise the data available.
+
+```{r final-test-eval}
+# Refit on FULL training data (adjust model/formula based on results above)
+final_model <- glm(satisfaction ~ ., data = train, family = binomial)
+
+final_probs <- predict(final_model, newdata = test, type = "response")
+final_pred  <- factor(ifelse(final_probs > 0.5, "satisfied",
+                              "neutral or dissatisfied"), levels = levels(test_y))
+final_cm  <- confusionMatrix(final_pred, test_y, positive = "satisfied")
+final_roc <- roc(test_y, final_probs,
+                  levels = c("neutral or dissatisfied", "satisfied"))
+
+cat("\n=== FINAL MODEL — Test Set Performance ===\n\n")
+final_cm
+```
+
+```{r final-plots, fig.height=5, fig.width=10}
+p_cm <- plot_cm(final_cm, "Final Model — Confusion Matrix (Test Set)")
+
+roc_df <- tibble(
+  Sensitivity = final_roc$sensitivities,
+  Specificity = 1 - final_roc$specificities
+)
+p_roc <- ggplot(roc_df, aes(x = Specificity, y = Sensitivity)) +
+  geom_line(color = "#E74C3C", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  annotate("text", x = 0.6, y = 0.4,
+           label = paste0("AUC = ", round(auc(final_roc), 4)),
+           size = 5, fontface = "bold") +
+  labs(title = "Final Model — ROC Curve (Test Set)",
+       x = "1 - Specificity", y = "Sensitivity") +
+  theme_minimal()
+
+grid.arrange(p_cm, p_roc, ncol = 2)
+```
+
+```{r final-summary-table}
+tibble(
+  Metric = c("Accuracy", "Precision", "Recall (Sensitivity)",
+             "Specificity", "F1 Score", "AUC"),
+  Value = c(final_cm$overall["Accuracy"], final_cm$byClass["Pos Pred Value"],
+            final_cm$byClass["Sensitivity"], final_cm$byClass["Specificity"],
+            final_cm$byClass["F1"], as.numeric(auc(final_roc)))
+) %>% kable(digits = 4) %>%
   kable_styling(bootstrap_options = "striped", full_width = FALSE)
 ```
 
