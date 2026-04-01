@@ -27,7 +27,7 @@ knitr::opts_chunk$set(
 # Install packages if needed (uncomment on first run)
 # install.packages(c("tidyverse", "janitor", "skimr", "corrplot", "caret",
 #                     "MASS", "class", "e1071", "glmnet", "pROC",
-#                     "knitr", "kableExtra", "gridExtra", "boot", "bestglm"))
+#                     "knitr", "kableExtra", "gridExtra", "boot"))
 
 library(tidyverse)
 library(janitor)
@@ -35,12 +35,14 @@ library(skimr)
 library(corrplot)
 library(caret)
 library(MASS)
+library(class)
+library(e1071)
+library(glmnet)
 library(pROC)
 library(knitr)
 library(kableExtra)
 library(gridExtra)
 library(boot)
-library(bestglm)
 
 set.seed(42)
 ```
@@ -685,58 +687,579 @@ if (length(dropped) > 0) {
   cat("Both criteria selected the same variables.\n")
 }
 ```
-AIC Forward kept all predictors
-BIC removed gate_location, food_and_drink, genderMale, Filght_service
 
-#LDA on full data
+The AIC forward selection retained all 23 predictors — the penalty was not strong enough to exclude any variable given the large sample size. The BIC model, with its heavier penalty ($\log n \approx 11.5$ vs 2 for AIC), dropped four predictors: `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. These are precisely the variables that showed high p-values in the full logistic regression, confirming that they contribute negligible discriminative power after accounting for the other predictors. We adopt the **BIC-selected 19-predictor model** as our reduced model going forward, as it achieves nearly the same fit with fewer parameters.
 
-We will do LDA on Reduced model 
-```{r}
-colnames(train_scaled)
-```
-```{r}
-lda_full <- lda(satisfaction~ ., data= train_scaled)
-summary(lda_full)
-lda_full_preds <- predict(lda_full)
-ld_full_values <- lda_full_preds$x
+## Linear Discriminant Analysis (LDA)
 
-df_full <- data.frame(LD1 = ld_full_values[,1],
-                 class = train_scaled$satisfaction)
-plot(ld_full_values, col = train_scaled$satisfaction,
-     pch = 19,
-     xlab = "id_values",
-     main = "LDA projection")
-ggplot(df_full, aes(x = LD1, fill = class)) +
-  geom_density(alpha = 0.4)
+LDA finds a linear combination of predictors that maximises the ratio of between-class variance to within-class variance — i.e., Fisher's criterion. For a binary problem ($K = 2$), this produces a single discriminant axis, LD1. LDA assumes that both classes share a common covariance matrix $\Sigma$, so the log-ratio of the class-conditional densities simplifies to a linear function of the predictors, yielding a linear decision boundary.
+
+Formally, LDA classifies an observation $\mathbf{x}$ to the class $k$ that maximises the discriminant score:
+
+$$\delta_k(\mathbf{x}) = \mathbf{x}^\top \Sigma^{-1} \boldsymbol{\mu}_k - \tfrac{1}{2} \boldsymbol{\mu}_k^\top \Sigma^{-1} \boldsymbol{\mu}_k + \log \pi_k$$
+
+where $\boldsymbol{\mu}_k$ is the class mean vector, $\Sigma$ is the pooled within-class covariance, and $\pi_k$ is the prior probability for class $k$.
+
+### LDA on Full Model
+
+```{r lda-full}
+lda_full <- lda(satisfaction ~ ., data = train_scaled)
+lda_full
 ```
 
-```{r}
-lda_reduced <- lda(satisfaction~ . -gate_location-gender-flight_distance, data= train_scaled)
-summary(lda_reduced)
+### LD1 Scaling (Discriminant Coefficients)
 
-```
-```{r}
-lda_pred <- predict(lda_reduced)
-ld_values <- lda_pred$x
+The LD1 scaling vector defines the linear combination of predictors that forms the discriminant axis. Each coefficient indicates how much each predictor contributes to the discriminant axis — because predictors have been standardised, the magnitudes are directly comparable, with larger absolute values signalling stronger contribution to class separation.
 
-plot(ld_values, col = train_scaled$satisfaction,
-     pch = 19,
-     xlab = "id_values",
-     main = "LDA projection")
-```
- Distributions of LD1 per class
- 
-```{r}
-library(ggplot2)
+```{r lda-full-coefficients, fig.height=7}
+# Extract and sort LD1 coefficients
+lda_coefs <- data.frame(
+  Variable = rownames(lda_full$scaling),
+  LD1      = round(lda_full$scaling[, 1], 4)
+) %>%
+  arrange(desc(abs(LD1)))
 
-df <- data.frame(LD1 = ld_values[,1],
-                 class = train_scaled$satisfaction)
-
-ggplot(df, aes(x = LD1, fill = class)) +
-  geom_density(alpha = 0.4)
+# Table of all coefficients
+lda_coefs %>%
+  kable(row.names = FALSE, col.names = c("Variable", "LD1 Coefficient"),
+        caption = "LD1 Scaling Coefficients (sorted by |coefficient|)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-Variable Importance
-```{r}
-lda_reduced$scaling
+```{r lda-coef-barplot, fig.height=7}
+# Visual: horizontal bar plot of LD1 coefficients
+lda_coefs %>%
+  mutate(Variable = factor(Variable, levels = rev(Variable))) %>%
+  ggplot(aes(x = LD1, y = Variable, fill = LD1 > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "#3498DB", "FALSE" = "#E74C3C")) +
+  geom_vline(xintercept = 0, linewidth = 0.5) +
+  labs(title = "LDA Scaling Coefficients (LD1)",
+       subtitle = "Blue = positive (pushes toward satisfied), Red = negative (pushes toward dissatisfied)",
+       x = "LD1 Coefficient", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.subtitle = element_text(color = "grey40"))
 ```
+
+**Interpretation of the scaling vector.**  The LD1 scaling vector defines the linear combination of predictors that forms the discriminant axis — the direction in feature space that best separates the two classes. The three strongest drivers of satisfaction are online_boarding (1.613), inflight_wifi_service (1.365), and customer_type: Loyal Customer (1.252), while type_of_travel: Personal Travel (-1.544) and ease_of_online_booking (-0.819) are the strongest drivers of dissatisfaction. Predictors such as genderMale (0.029) and flight_distance (0.005) contribute negligibly to the discriminant axis.
+
+Add interpreation that fron the logistic regression BIC feature selection, of the variables that where removed appear also to have low ld1 coefficient (if they do)
+
+**Group means.** We observe that predictors with larger differences in group means tend to receive larger LD1 coefficients in absolute value. For example, online_boarding (group means: 0.531 vs 0.805, difference: 0.274) has the largest positive coefficient (1.613), and type_of_travel: Personal Travel (0.492 vs 0.073, difference: 0.419) has the largest negative coefficient (-1.544). Conversely, predictors with nearly identical group means across classes receive near-zero coefficients, such as genderMale (0.487 vs 0.500, difference: 0.013, coefficient: 0.029) and departure_delay_in_minutes (0.044 vs -0.058, difference: 0.102, coefficient: 0.083). This is consistent with the LDA closed-form solution where between-class mean differences drive the discriminant axis.
+
+### LD1 Score Distribution
+
+Since we have a binary classification problem, LDA produces a single discriminant axis (LD1). The LD1 scores represent each observation's position along the direction that maximally separates the two classes. Visualising these scores as a histogram with kernel density estimation (KDE) overlays provides a direct view of how well LDA discriminates between satisfied and dissatisfied passengers.
+
+```{r lda-full-ld1-histogram, fig.height=6}
+lda_full_pred <- predict(lda_full)
+
+ld1_df <- data.frame(
+  LD1   = lda_full_pred$x[, 1],
+  Class = train_scaled$satisfaction
+)
+
+# Compute the LDA decision threshold (midpoint of group means on LD1)
+#group_means_ld1 <- tapply(ld1_df$LD1, ld1_df$Class, mean)
+#lda_threshold <- mean(group_means_ld1)
+
+ggplot(ld1_df, aes(x = LD1, fill = Class)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 80,
+                 alpha = 0.4, position = "identity", color = "white", linewidth = 0.1) +
+  geom_density(aes(color = Class), linewidth = 1, fill = NA) +
+#  geom_vline(xintercept = lda_threshold, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+#  annotate("text", x = lda_threshold, y = Inf, label = "Decision\nThreshold",
+#           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values = c("neutral or dissatisfied" = "#E74C3C",
+                                "satisfied" = "#3498DB")) +
+  scale_color_manual(values = c("neutral or dissatisfied" = "#C0392B",
+                                 "satisfied" = "#2980B9")) +
+  labs(title = "LDA: Distribution of LD1 Scores by Class",
+       subtitle = "Histogram with KDE overlay ",
+       x = "LD1 Score", y = "Density",
+       fill = "Class", color = "Class") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(color = "grey40"))
+```
+
+The two classes are well separated along LD1, with satisfied passengers concentrating around positive scores and dissatisfied passengers around negative scores. The overlap region near zero represents observations where the two classes are hardest to distinguish, and corresponds to the highest classification uncertainty under the model. The skewness visible in the satisfied class suggests the normality assumption may be imperfect, which motivates also fitting QDA as a comparison.
+
+
+## Principal Component Analysis (PCA)
+
+Before fitting PCA-based classifiers, we apply PCA to the numeric predictor matrix to reduce dimensionality. PCA finds orthogonal directions of maximum variance in the data, which can help mitigate multicollinearity and reduce the number of parameters that need to be estimated — particularly relevant for QDA, which estimates a full covariance matrix per class.
+
+We apply PCA to the **model matrix** (with dummy-encoded categoricals) to ensure all predictors are numeric.
+
+```{r pca-fit}
+# Build numeric model matrix (same as used for step selection)
+train_mm_pca <- as.data.frame(
+  model.matrix(satisfaction ~ ., data = train_scaled)[, -1]
+)
+
+# PCA on the predictor matrix (already scaled)
+pca_fit <- prcomp(train_mm_pca, center = TRUE, scale. = TRUE)
+
+# Variance explained
+pca_var <- summary(pca_fit)
+pca_var
+```
+
+### Scree Plot and Cumulative Variance
+
+```{r pca-scree, fig.height=5}
+var_explained <- pca_var$importance[2, ]  # Proportion of variance
+cum_var       <- pca_var$importance[3, ]  # Cumulative proportion
+
+pca_df <- data.frame(
+  PC = seq_along(var_explained),
+  Variance = var_explained,
+  Cumulative = cum_var
+)
+
+# Number of PCs for 90% variance
+n_pc_90 <- min(which(cum_var >= 0.90))
+cat("PCs needed for 90% variance:", n_pc_90, "\n")
+
+p1 <- ggplot(pca_df, aes(x = PC, y = Variance)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_line(color = "darkblue", linewidth = 0.8) +
+  geom_point(color = "darkblue", size = 2) +
+  labs(title = "Scree Plot", x = "Principal Component", y = "Proportion of Variance") +
+  scale_x_continuous(breaks = 1:length(var_explained)) +
+  theme_minimal()
+
+p2 <- ggplot(pca_df, aes(x = PC, y = Cumulative)) +
+  geom_line(color = "tomato", linewidth = 0.8) +
+  geom_point(color = "tomato", size = 2) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = n_pc_90, linetype = "dashed", color = "grey40") +
+  annotate("text", x = n_pc_90 + 0.5, y = 0.85,
+           label = paste0(n_pc_90, " PCs = 90%"), hjust = 0, size = 3.5) +
+  labs(title = "Cumulative Variance Explained",
+       x = "Principal Component", y = "Cumulative Proportion") +
+  scale_x_continuous(breaks = 1:length(var_explained)) +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+The scree plot shows how much variance each principal component captures. The cumulative plot identifies how many components are needed to reach the 90% threshold. We retain the first `r n_pc_90` principal components for the PCA-based classifiers.
+
+Note: We do not produce PCA-based decision boundary plots for LDA and QDA. Projecting the data onto just two principal components and then fitting a 2D classifier discards the information from all other components, which makes the resulting boundaries misleading. The LD1 histogram above already provides a more faithful representation of how LDA separates the classes using the full predictor space. For QDA, which does not produce a single discriminant axis, we focus instead on comparing group means and on predictive performance metrics in the evaluation section below.
+
+# Model Evaluation and Selection
+
+We now proceed to a systematic comparison of multiple classification methods across three predictor sets: the full model (all predictors), the BIC-reduced model (19 predictors), and the PCA-transformed data (components explaining 90% of variance). We also include regularised logistic regression (Lasso and Ridge) on the full predictor set.
+
+## Train–Validation Split
+
+We split the training data 80/20 into a fitting set and a validation set. The original `test.csv` remains completely untouched for final evaluation.
+
+```{r train-val-split}
+set.seed(42)
+val_idx   <- sample(nrow(train_scaled), size = round(0.2 * nrow(train_scaled)))
+train_fit <- train_scaled[-val_idx, ]
+train_val <- train_scaled[val_idx, ]
+
+cat("Fitting set:", nrow(train_fit), "observations\n")
+cat("Validation set:", nrow(train_val), "observations\n")
+cat("Class balance (fit):", round(prop.table(table(train_fit$satisfaction)) * 100, 1), "%\n")
+cat("Class balance (val):", round(prop.table(table(train_val$satisfaction)) * 100, 1), "%\n")
+```
+
+### Preparing the Three Predictor Sets
+
+```{r prepare-predictor-sets}
+# --- BIC-reduced formula ---
+bic_formula <- formula(step_fwd_bic)
+
+# --- PCA predictor sets ---
+# Refit PCA on the fitting set only (no leakage)
+train_fit_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_fit)[, -1])
+train_val_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_val)[, -1])
+
+pca_fit_only <- prcomp(train_fit_mm, center = TRUE, scale. = TRUE)
+cum_var_fit  <- cumsum(pca_fit_only$sdev^2 / sum(pca_fit_only$sdev^2))
+n_pc_90_fit  <- min(which(cum_var_fit >= 0.90))
+
+# Transform both sets
+train_fit_pca <- as.data.frame(predict(pca_fit_only, train_fit_mm)[, 1:n_pc_90_fit])
+train_val_pca <- as.data.frame(predict(pca_fit_only, train_val_mm)[, 1:n_pc_90_fit])
+train_fit_pca$satisfaction <- train_fit$satisfaction
+train_val_pca$satisfaction <- train_val$satisfaction
+
+cat("PCA components retained (90% variance on fitting set):", n_pc_90_fit, "\n")
+```
+
+## Single-Split Model Fitting
+
+We fit all models on the fitting set and evaluate on the validation set.
+
+```{r fit-all-models, cache=TRUE}
+library(class)   # KNN
+library(e1071)   # Naive Bayes
+library(glmnet)  # Lasso & Ridge
+
+# =============================================
+# Helper: get predicted probabilities for the positive class ("satisfied")
+# =============================================
+
+# --- 1. Logistic Regression (Full) ---
+glm_full_fit <- glm(satisfaction ~ ., data = train_fit, family = binomial)
+prob_glm_full <- predict(glm_full_fit, train_val, type = "response")
+
+# --- 2. Logistic Regression (BIC reduced) ---
+glm_bic_fit <- glm(bic_formula, data = train_fit, family = binomial)
+prob_glm_bic <- predict(glm_bic_fit, train_val, type = "response")
+
+# --- 3. Logistic Regression (PCA) ---
+glm_pca_fit <- glm(satisfaction ~ ., data = train_fit_pca, family = binomial)
+prob_glm_pca <- predict(glm_pca_fit, train_val_pca, type = "response")
+
+# --- 4. LDA (Full) ---
+lda_full_fit <- lda(satisfaction ~ ., data = train_fit)
+prob_lda_full <- predict(lda_full_fit, train_val)$posterior[, "satisfied"]
+
+# --- 5. LDA (BIC reduced) ---
+lda_bic_fit <- lda(bic_formula, data = train_fit)
+prob_lda_bic <- predict(lda_bic_fit, train_val)$posterior[, "satisfied"]
+
+# --- 6. LDA (PCA) ---
+lda_pca_fit <- lda(satisfaction ~ ., data = train_fit_pca)
+prob_lda_pca <- predict(lda_pca_fit, train_val_pca)$posterior[, "satisfied"]
+
+# --- 7. QDA (Full) ---
+qda_full_fit <- qda(satisfaction ~ ., data = train_fit)
+prob_qda_full <- predict(qda_full_fit, train_val)$posterior[, "satisfied"]
+
+# --- 8. QDA (BIC reduced) ---
+qda_bic_fit <- qda(bic_formula, data = train_fit)
+prob_qda_bic <- predict(qda_bic_fit, train_val)$posterior[, "satisfied"]
+
+# --- 9. QDA (PCA) ---
+qda_pca_fit <- qda(satisfaction ~ ., data = train_fit_pca)
+prob_qda_pca <- predict(qda_pca_fit, train_val_pca)$posterior[, "satisfied"]
+
+# --- 10. KNN (Full) — k = 1, 5, 10, 20 ---
+# KNN needs numeric matrix
+train_fit_knn <- as.data.frame(model.matrix(satisfaction ~ ., data = train_fit)[, -1])
+train_val_knn <- as.data.frame(model.matrix(satisfaction ~ ., data = train_val)[, -1])
+train_fit_knn_bic <- as.data.frame(model.matrix(bic_formula, data = train_fit)[, -1])
+train_val_knn_bic <- as.data.frame(model.matrix(bic_formula, data = train_val)[, -1])
+
+knn_ks <- c(1, 5, 10, 20)
+knn_results <- list()
+for (k_val in knn_ks) {
+  # Full
+  knn_pred <- knn(train_fit_knn, train_val_knn,
+                  cl = train_fit$satisfaction, k = k_val, prob = TRUE)
+  knn_prob <- attr(knn_pred, "prob")
+  # knn() returns prob of the winning class — convert to prob of "satisfied"
+  knn_prob_satisfied <- ifelse(knn_pred == "satisfied", knn_prob, 1 - knn_prob)
+  knn_results[[paste0("KNN_k", k_val, "_Full")]] <- knn_prob_satisfied
+
+  # BIC
+  knn_pred_b <- knn(train_fit_knn_bic, train_val_knn_bic,
+                    cl = train_fit$satisfaction, k = k_val, prob = TRUE)
+  knn_prob_b <- attr(knn_pred_b, "prob")
+  knn_prob_sat_b <- ifelse(knn_pred_b == "satisfied", knn_prob_b, 1 - knn_prob_b)
+  knn_results[[paste0("KNN_k", k_val, "_BIC")]] <- knn_prob_sat_b
+
+  # PCA
+  knn_pred_p <- knn(train_fit_pca[, -ncol(train_fit_pca)],
+                    train_val_pca[, -ncol(train_val_pca)],
+                    cl = train_fit$satisfaction, k = k_val, prob = TRUE)
+  knn_prob_p <- attr(knn_pred_p, "prob")
+  knn_prob_sat_p <- ifelse(knn_pred_p == "satisfied", knn_prob_p, 1 - knn_prob_p)
+  knn_results[[paste0("KNN_k", k_val, "_PCA")]] <- knn_prob_sat_p
+}
+
+# --- 11. Naive Bayes (Full, BIC, PCA) ---
+nb_full_fit <- naiveBayes(satisfaction ~ ., data = train_fit)
+prob_nb_full <- predict(nb_full_fit, train_val, type = "raw")[, "satisfied"]
+
+nb_bic_fit <- naiveBayes(bic_formula, data = train_fit)
+prob_nb_bic <- predict(nb_bic_fit, train_val, type = "raw")[, "satisfied"]
+
+nb_pca_fit <- naiveBayes(satisfaction ~ ., data = train_fit_pca)
+prob_nb_pca <- predict(nb_pca_fit, train_val_pca, type = "raw")[, "satisfied"]
+
+# --- 12. Lasso (Full) ---
+x_train_lasso <- model.matrix(satisfaction ~ ., data = train_fit)[, -1]
+y_train_lasso <- as.integer(train_fit$satisfaction == "satisfied")
+x_val_lasso   <- model.matrix(satisfaction ~ ., data = train_val)[, -1]
+
+set.seed(42)
+cv_lasso <- cv.glmnet(x_train_lasso, y_train_lasso,
+                       family = "binomial", alpha = 1, nfolds = 10)
+prob_lasso <- as.numeric(predict(cv_lasso, x_val_lasso,
+                                  s = "lambda.min", type = "response"))
+
+# --- 13. Ridge (Full) ---
+set.seed(42)
+cv_ridge <- cv.glmnet(x_train_lasso, y_train_lasso,
+                       family = "binomial", alpha = 0, nfolds = 10)
+prob_ridge <- as.numeric(predict(cv_ridge, x_val_lasso,
+                                  s = "lambda.min", type = "response"))
+
+cat("All models fitted successfully.\n")
+```
+
+## ROC Curves (Single Split)
+
+```{r roc-curves, fig.height=10, fig.width=12}
+# Actual labels
+val_labels <- train_val$satisfaction
+
+# Collect all probabilities into a named list
+all_probs <- list(
+  "GLM Full"       = prob_glm_full,
+  "GLM BIC"        = prob_glm_bic,
+  "GLM PCA"        = prob_glm_pca,
+  "LDA Full"       = prob_lda_full,
+  "LDA BIC"        = prob_lda_bic,
+  "LDA PCA"        = prob_lda_pca,
+  "QDA Full"       = prob_qda_full,
+  "QDA BIC"        = prob_qda_bic,
+  "QDA PCA"        = prob_qda_pca,
+  "NB Full"        = prob_nb_full,
+  "NB BIC"         = prob_nb_bic,
+  "NB PCA"         = prob_nb_pca,
+  "Lasso"          = prob_lasso,
+  "Ridge"          = prob_ridge
+)
+
+# Add best KNN per dataset (we'll pick k=5 as a representative for ROC)
+all_probs[["KNN k5 Full"]] <- knn_results[["KNN_k5_Full"]]
+all_probs[["KNN k5 BIC"]]  <- knn_results[["KNN_k5_BIC"]]
+all_probs[["KNN k5 PCA"]]  <- knn_results[["KNN_k5_PCA"]]
+
+# Compute ROC curves
+roc_list <- lapply(all_probs, function(p) {
+  roc(val_labels, p, levels = c("neutral or dissatisfied", "satisfied"),
+      direction = "<", quiet = TRUE)
+})
+
+# Extract AUC values
+auc_values <- sapply(roc_list, function(r) as.numeric(auc(r)))
+
+# Plot ROC curves — grouped by method type
+# Panel 1: Logistic Regression variants
+roc_glm <- roc_list[grep("GLM|Lasso|Ridge", names(roc_list))]
+# Panel 2: LDA/QDA
+roc_da  <- roc_list[grep("LDA|QDA", names(roc_list))]
+# Panel 3: KNN and NB
+roc_other <- roc_list[grep("KNN|NB", names(roc_list))]
+
+par(mfrow = c(2, 2))
+
+# All models on one plot
+plot(roc_list[[1]], col = 1, main = "All Models — ROC Curves", legacy.axes = TRUE)
+colors <- rainbow(length(roc_list))
+for (i in seq_along(roc_list)) {
+  plot(roc_list[[i]], col = colors[i], add = (i > 1), legacy.axes = TRUE)
+}
+legend("bottomright", names(roc_list),
+       col = colors, lwd = 2, cex = 0.55, ncol = 2)
+
+# GLM family
+plot(roc_glm[[1]], col = 1, main = "Logistic / Lasso / Ridge", legacy.axes = TRUE)
+for (i in seq_along(roc_glm)) {
+  plot(roc_glm[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
+}
+legend("bottomright",
+       paste0(names(roc_glm), " (", round(sapply(roc_glm, auc), 4), ")"),
+       col = seq_along(roc_glm), lwd = 2, cex = 0.7)
+
+# DA family
+plot(roc_da[[1]], col = 1, main = "LDA / QDA", legacy.axes = TRUE)
+for (i in seq_along(roc_da)) {
+  plot(roc_da[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
+}
+legend("bottomright",
+       paste0(names(roc_da), " (", round(sapply(roc_da, auc), 4), ")"),
+       col = seq_along(roc_da), lwd = 2, cex = 0.7)
+
+# KNN and NB
+plot(roc_other[[1]], col = 1, main = "KNN / Naive Bayes", legacy.axes = TRUE)
+for (i in seq_along(roc_other)) {
+  plot(roc_other[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
+}
+legend("bottomright",
+       paste0(names(roc_other), " (", round(sapply(roc_other, auc), 4), ")"),
+       col = seq_along(roc_other), lwd = 2, cex = 0.7)
+
+par(mfrow = c(1, 1))
+```
+
+### Single-Split AUC Summary Table
+
+```{r auc-summary-table}
+auc_df <- data.frame(
+  Model = names(auc_values),
+  AUC   = round(auc_values, 4)
+) %>%
+  arrange(desc(AUC))
+
+auc_df %>%
+  kable(row.names = FALSE, col.names = c("Model", "Validation AUC")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### KNN Performance Across k Values
+
+```{r knn-k-comparison}
+knn_auc_df <- data.frame(
+  k       = rep(knn_ks, 3),
+  Dataset = rep(c("Full", "BIC", "PCA"), each = length(knn_ks)),
+  AUC     = sapply(names(knn_results), function(nm) {
+    as.numeric(auc(roc(val_labels, knn_results[[nm]],
+                       levels = c("neutral or dissatisfied", "satisfied"),
+                       direction = "<", quiet = TRUE)))
+  })
+)
+
+knn_auc_df %>%
+  pivot_wider(names_from = Dataset, values_from = AUC) %>%
+  kable(digits = 4, col.names = c("k", "Full", "BIC Reduced", "PCA")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## Cross-Validation Model Comparison
+
+We use 5-fold cross-validation on the full training set to get robust AUC estimates. This avoids the variance of a single train-validation split and provides confidence intervals for model comparison.
+
+```{r cv-comparison, cache=TRUE}
+set.seed(42)
+n_folds <- 5
+folds   <- createFolds(train_scaled$satisfaction, k = n_folds, returnTrain = FALSE)
+
+# Models to cross-validate (excluding KNN for speed — evaluated separately)
+cv_models <- c("GLM Full", "GLM BIC", "GLM PCA",
+               "LDA Full", "LDA BIC", "LDA PCA",
+               "QDA Full", "QDA BIC", "QDA PCA",
+               "NB Full", "NB BIC", "NB PCA",
+               "Lasso", "Ridge")
+
+cv_auc_matrix <- matrix(NA, nrow = n_folds, ncol = length(cv_models),
+                         dimnames = list(NULL, cv_models))
+
+for (f in seq_len(n_folds)) {
+  cat("Fold", f, "of", n_folds, "\n")
+
+  idx_val  <- folds[[f]]
+  tr       <- train_scaled[-idx_val, ]
+  va       <- train_scaled[idx_val, ]
+  va_lab   <- va$satisfaction
+
+  # PCA per fold (no leakage)
+  tr_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = tr)[, -1])
+  va_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = va)[, -1])
+  pca_f <- prcomp(tr_mm, center = TRUE, scale. = TRUE)
+  cum_f <- cumsum(pca_f$sdev^2 / sum(pca_f$sdev^2))
+  npc_f <- min(which(cum_f >= 0.90))
+
+  tr_pca <- as.data.frame(predict(pca_f, tr_mm)[, 1:npc_f])
+  va_pca <- as.data.frame(predict(pca_f, va_mm)[, 1:npc_f])
+  tr_pca$satisfaction <- tr$satisfaction
+  va_pca$satisfaction <- va$satisfaction
+
+  # Helper to compute AUC
+  get_auc <- function(probs) {
+    as.numeric(auc(roc(va_lab, probs,
+                       levels = c("neutral or dissatisfied", "satisfied"),
+                       direction = "<", quiet = TRUE)))
+  }
+
+  # GLM
+  cv_auc_matrix[f, "GLM Full"] <- get_auc(predict(glm(satisfaction ~ ., data = tr, family = binomial), va, type = "response"))
+  cv_auc_matrix[f, "GLM BIC"]  <- get_auc(predict(glm(bic_formula, data = tr, family = binomial), va, type = "response"))
+  cv_auc_matrix[f, "GLM PCA"]  <- get_auc(predict(glm(satisfaction ~ ., data = tr_pca, family = binomial), va_pca, type = "response"))
+
+  # LDA
+  cv_auc_matrix[f, "LDA Full"] <- get_auc(predict(lda(satisfaction ~ ., data = tr), va)$posterior[, "satisfied"])
+  cv_auc_matrix[f, "LDA BIC"]  <- get_auc(predict(lda(bic_formula, data = tr), va)$posterior[, "satisfied"])
+  cv_auc_matrix[f, "LDA PCA"]  <- get_auc(predict(lda(satisfaction ~ ., data = tr_pca), va_pca)$posterior[, "satisfied"])
+
+  # QDA
+  cv_auc_matrix[f, "QDA Full"] <- get_auc(predict(qda(satisfaction ~ ., data = tr), va)$posterior[, "satisfied"])
+  cv_auc_matrix[f, "QDA BIC"]  <- get_auc(predict(qda(bic_formula, data = tr), va)$posterior[, "satisfied"])
+  cv_auc_matrix[f, "QDA PCA"]  <- get_auc(predict(qda(satisfaction ~ ., data = tr_pca), va_pca)$posterior[, "satisfied"])
+
+  # Naive Bayes
+  cv_auc_matrix[f, "NB Full"]  <- get_auc(predict(naiveBayes(satisfaction ~ ., data = tr), va, type = "raw")[, "satisfied"])
+  cv_auc_matrix[f, "NB BIC"]   <- get_auc(predict(naiveBayes(bic_formula, data = tr), va, type = "raw")[, "satisfied"])
+  cv_auc_matrix[f, "NB PCA"]   <- get_auc(predict(naiveBayes(satisfaction ~ ., data = tr_pca), va_pca, type = "raw")[, "satisfied"])
+
+  # Lasso & Ridge
+  x_tr <- model.matrix(satisfaction ~ ., data = tr)[, -1]
+  y_tr <- as.integer(tr$satisfaction == "satisfied")
+  x_va <- model.matrix(satisfaction ~ ., data = va)[, -1]
+
+  cv_l <- cv.glmnet(x_tr, y_tr, family = "binomial", alpha = 1, nfolds = 5)
+  cv_auc_matrix[f, "Lasso"] <- get_auc(as.numeric(predict(cv_l, x_va, s = "lambda.min", type = "response")))
+
+  cv_r <- cv.glmnet(x_tr, y_tr, family = "binomial", alpha = 0, nfolds = 5)
+  cv_auc_matrix[f, "Ridge"] <- get_auc(as.numeric(predict(cv_r, x_va, s = "lambda.min", type = "response")))
+}
+
+cat("Cross-validation complete.\n")
+```
+
+### Cross-Validation AUC Results
+
+```{r cv-results-table}
+cv_summary <- data.frame(
+  Model    = colnames(cv_auc_matrix),
+  Mean_AUC = round(colMeans(cv_auc_matrix), 4),
+  SD_AUC   = round(apply(cv_auc_matrix, 2, sd), 4),
+  Min_AUC  = round(apply(cv_auc_matrix, 2, min), 4),
+  Max_AUC  = round(apply(cv_auc_matrix, 2, max), 4)
+) %>%
+  arrange(desc(Mean_AUC))
+
+cv_summary %>%
+  kable(row.names = FALSE,
+        col.names = c("Model", "Mean AUC", "SD", "Min", "Max")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Cross-Validation AUC Box Plot
+
+```{r cv-boxplot, fig.height=7, fig.width=10}
+cv_long <- as.data.frame(cv_auc_matrix) %>%
+  pivot_longer(everything(), names_to = "Model", values_to = "AUC")
+
+# Order by mean AUC
+model_order <- cv_summary$Model
+cv_long$Model <- factor(cv_long$Model, levels = rev(model_order))
+
+ggplot(cv_long, aes(x = Model, y = AUC, fill = Model)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "5-Fold Cross-Validation: AUC by Model",
+       x = "", y = "AUC") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+### Best Model Selection
+
+```{r best-model}
+best_model <- cv_summary$Model[1]
+best_auc   <- cv_summary$Mean_AUC[1]
+
+cat("=== Best Model by Mean CV AUC ===\n")
+cat("Model:", best_model, "\n")
+cat("Mean AUC:", best_auc, "(±", cv_summary$SD_AUC[1], ")\n\n")
+
+cat("Top 5 models:\n")
+for (i in 1:min(5, nrow(cv_summary))) {
+  cat(sprintf("  %d. %s — AUC: %.4f (± %.4f)\n",
+              i, cv_summary$Model[i], cv_summary$Mean_AUC[i], cv_summary$SD_AUC[i]))
+}
+```
+
+The cross-validated AUC comparison provides a robust ranking of all models. Models that perform similarly within one standard deviation of each other are effectively equivalent — in such cases we prefer the simpler model (fewer predictors or fewer assumptions). The box plot visualises the stability of each model across folds: a narrow box indicates consistent performance, while a wide box suggests sensitivity to the particular data split.
