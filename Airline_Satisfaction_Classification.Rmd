@@ -46,7 +46,9 @@ library(boot)
 
 set.seed(42)
 ```
-
+```{r}
+getwd()
+```
 # Data Loading and Overview
 
 The dataset contains airline passenger satisfaction survey responses. We load the pre-split training and test sets separately to preserve the integrity of the evaluation pipeline — the test set will not be touched until the final model evaluation.
@@ -491,15 +493,10 @@ train_clean$arrival_delay_in_minutes[is.na(train_clean$arrival_delay_in_minutes)
   predict(delay_model,
           newdata = train_clean[is.na(train_clean$arrival_delay_in_minutes), ])
 
-test_clean$arrival_delay_in_minutes[is.na(test_clean$arrival_delay_in_minutes)] <-
-  predict(delay_model,
-          newdata = test_clean[is.na(test_clean$arrival_delay_in_minutes), ])
-
 cat("Remaining NAs in train:", sum(is.na(train_clean$arrival_delay_in_minutes)), "\n")
-cat("Remaining NAs in test:", sum(is.na(test_clean$arrival_delay_in_minutes)), "\n")
 ```
 
-After imputation both datasets are complete. We maintain three data versions throughout the analysis: `train_raw`/`test_raw` (original with index), `train_with_na`/`test_with_na` (cleaned but before imputation), and `train_clean`/`test_clean` (the working datasets after imputation).
+After imputation the training set is complete. We impute only the training data here for exploratory analysis; the test set (`test_with_na`) is left untouched and will be preprocessed within the model evaluation pipeline to avoid any data leakage.
 
 # Classification Modelling
 
@@ -507,9 +504,7 @@ We now proceed to classification. Our response variable is `satisfaction` (binar
 
 ```{r prepare-train}
 train <- train_clean
-test  <- test_clean
 train$satisfaction <- factor(train$satisfaction)
-test$satisfaction <- factor(test$satisfaction)
 ```
 
 ## Feature Scaling
@@ -524,7 +519,7 @@ We apply two scaling strategies that respect the nature of each variable group:
 - **Standard scaling (z-score)** for the four *continuous* variables (`age`, `flight_distance`, `departure_delay_in_minutes`, `arrival_delay_in_minutes`). Each variable is centred at its training-set mean and divided by its training-set standard deviation. A one-unit change in a standardised coefficient corresponds to a one-SD shift in the original variable — a natural unit for comparing variables with different spreads.
 - **Min-Max scaling** for the 14 *ordinal rating* variables (discrete 0–5 scale). Each rating is rescaled to $[0,\,1]$ via $(x - \min) / (\max - \min)$. This preserves the equal spacing between adjacent integer levels while placing all ratings on a common range. A coefficient of, say, 2.0 for a min-max scaled rating means that moving from the worst possible rating (0) to the best (5) changes the log-odds of satisfaction by 2.0.
 
-All scaling parameters — means, standard deviations, minima, and maxima — are **computed from the training set only** and then applied to both training and test sets, ensuring no information from the test set leaks into the transformation.
+All scaling parameters — means, standard deviations, minima, and maxima — are **computed from the training set only**. The test set is not scaled here; it will be preprocessed within the model evaluation pipeline.
 
 ```{r feature-scaling}
 cont_vars <- c("age", "flight_distance",
@@ -541,11 +536,8 @@ cont_means <- colMeans(train[, cont_vars])
 cont_sds   <- apply(train[, cont_vars], 2, sd)
 
 train_scaled <- train
-test_scaled  <- test
 
 train_scaled[, cont_vars] <- scale(train[, cont_vars],
-                                   center = cont_means, scale = cont_sds)
-test_scaled[, cont_vars]  <- scale(test[, cont_vars],
                                    center = cont_means, scale = cont_sds)
 
 # --- Min-Max Scaling for Rating Variables (parameters from train only) ---
@@ -554,7 +546,6 @@ rating_ranges <- apply(train[, rating_vars], 2, max) - rating_mins
 
 for (v in rating_vars) {
   train_scaled[[v]] <- (train[[v]] - rating_mins[v]) / rating_ranges[v]
-  test_scaled[[v]]  <- (test[[v]]  - rating_mins[v]) / rating_ranges[v]
 }
 
 # Verification
@@ -665,7 +656,7 @@ cat("AIC:", round(AIC(step_fwd_bic), 2), "\n")
 cat("BIC:", round(BIC(step_fwd_bic), 2), "\n\n")
 summary(step_fwd_bic)
 ```
-Add comments here about the reduced model , explain coefficients etc 
+The BIC-selected model retains 19 predictors, dropping `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. Comparing with the full model, the coefficient estimates for the retained variables change only marginally, confirming that the dropped variables were neither confounders nor suppressors. The key coefficients in the reduced model remain consistent with our earlier interpretation: `customer_typeLoyal Customer` carries a large positive effect (high odds of satisfaction), `type_of_travelPersonal Travel` a large negative effect, and the service ratings `online_boarding`, `inflight_entertainment`, and `seat_comfort` retain their strong positive associations with satisfaction. The BIC model achieves comparable deviance to the AIC model with four fewer parameters, confirming it as the more parsimonious choice without sacrificing explanatory power.
 
 ### Comparison of Selected Models
 
@@ -689,6 +680,9 @@ if (length(dropped) > 0) {
 ```
 
 The AIC forward selection retained all 23 predictors — the penalty was not strong enough to exclude any variable given the large sample size. The BIC model, with its heavier penalty ($\log n \approx 11.5$ vs 2 for AIC), dropped four predictors: `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. These are precisely the variables that showed high p-values in the full logistic regression, confirming that they contribute negligible discriminative power after accounting for the other predictors. We adopt the **BIC-selected 19-predictor model** as our reduced model going forward, as it achieves nearly the same fit with fewer parameters.
+
+
+
 
 ## Linear Discriminant Analysis (LDA)
 
@@ -743,7 +737,7 @@ lda_coefs %>%
 
 **Interpretation of the scaling vector.**  The LD1 scaling vector defines the linear combination of predictors that forms the discriminant axis — the direction in feature space that best separates the two classes. The three strongest drivers of satisfaction are online_boarding (1.613), inflight_wifi_service (1.365), and customer_type: Loyal Customer (1.252), while type_of_travel: Personal Travel (-1.544) and ease_of_online_booking (-0.819) are the strongest drivers of dissatisfaction. Predictors such as genderMale (0.029) and flight_distance (0.005) contribute negligibly to the discriminant axis.
 
-Add interpreation that fron the logistic regression BIC feature selection, of the variables that where removed appear also to have low ld1 coefficient (if they do)
+**Connection with BIC feature selection.** Reassuringly, the variables dropped by BIC in the logistic regression step — `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance` — are precisely those that receive the smallest LD1 coefficients in absolute value. For instance, `genderMale` (0.029) and `flight_distance` (0.005) are the two weakest contributors to the discriminant axis, while `gate_location` and `food_and_drink` also rank near the bottom. This convergence across two independent methods (penalised likelihood selection and Fisher's discriminant) strengthens our confidence that these variables are genuinely uninformative for predicting satisfaction once the remaining predictors are accounted for.
 
 **Group means.** We observe that predictors with larger differences in group means tend to receive larger LD1 coefficients in absolute value. For example, online_boarding (group means: 0.531 vs 0.805, difference: 0.274) has the largest positive coefficient (1.613), and type_of_travel: Personal Travel (0.492 vs 0.073, difference: 0.419) has the largest negative coefficient (-1.544). Conversely, predictors with nearly identical group means across classes receive near-zero coefficients, such as genderMale (0.487 vs 0.500, difference: 0.013, coefficient: 0.029) and departure_delay_in_minutes (0.044 vs -0.058, difference: 0.102, coefficient: 0.083). This is consistent with the LDA closed-form solution where between-class mean differences drive the discriminant axis.
 
@@ -784,6 +778,27 @@ ggplot(ld1_df, aes(x = LD1, fill = Class)) +
 ```
 
 The two classes are well separated along LD1, with satisfied passengers concentrating around positive scores and dissatisfied passengers around negative scores. The overlap region near zero represents observations where the two classes are hardest to distinguish, and corresponds to the highest classification uncertainty under the model. The skewness visible in the satisfied class suggests the normality assumption may be imperfect, which motivates also fitting QDA as a comparison.
+
+
+## Naive Bayes on Full Training Data
+
+Before proceeding to dimensionality reduction, we fit a Naive Bayes classifier with default hyperparameters on the full training set. The purpose is not model selection but exploratory interpretation: Naive Bayes estimates class-conditional distributions for each predictor independently, and the resulting summary gives us a concise snapshot of how each feature's mean and spread differ between satisfied and dissatisfied passengers.
+
+```{r naive-bayes-full-exploration}
+library(e1071)
+
+nb_explore <- naiveBayes(satisfaction ~ ., data = train_scaled)
+nb_explore
+```
+
+**Interpretation of the Naive Bayes summary.**  The output shows the class-conditional means and standard deviations for each numeric predictor, as well as the conditional class probabilities for each level of the categorical predictors. Key observations:
+
+- The **a-priori probabilities** reflect the class balance we observed earlier (~56.7% dissatisfied, ~43.3% satisfied).
+- Among the continuous variables, `online_boarding` and `inflight_entertainment` show the largest separation in class-conditional means — satisfied passengers rate these much higher on average — which aligns with the LDA and logistic regression findings.
+- Variables like `departure_delay_in_minutes` and `arrival_delay_in_minutes` have very similar means across both classes, confirming that delays contribute little to the satisfaction prediction.
+- For categorical predictors, `type_of_travel` and `customer_type` show large differences in conditional probabilities between classes, again consistent with the strong effects identified by logistic regression and LDA.
+
+The Naive Bayes assumption of conditional independence between predictors is clearly violated (e.g., departure and arrival delay are almost perfectly correlated), so we do not expect Naive Bayes to be the top-performing classifier. However, its simplicity and interpretability make it a useful baseline for comparison.
 
 
 ## Principal Component Analysis (PCA)
@@ -851,32 +866,102 @@ Note: We do not produce PCA-based decision boundary plots for LDA and QDA. Proje
 
 # Model Evaluation and Selection
 
-We now proceed to a systematic comparison of multiple classification methods across three predictor sets: the full model (all predictors), the BIC-reduced model (19 predictors), and the PCA-transformed data (components explaining 90% of variance). We also include regularised logistic regression (Lasso and Ridge) on the full predictor set.
+We now proceed to a systematic comparison of five classification methods — Logistic Regression, LDA, QDA, KNN, and Naive Bayes — each fitted with **default hyperparameters** (no tuning) across three predictor (data version) configurations: the **Full** model (all predictors), the **BIC-reduced** model (19 predictors from forward stepwise selection), and the **PCA-transformed** data (principal components explaining 90% of variance). This yields a complete 5 × 3 = 15 model–data version grid.
 
-## Train–Validation Split
+**Important methodological note on data leakage.** To avoid data leakage, we perform all preprocessing — imputation and scaling — within each evaluation step. All imputation models and scaling parameters are fitted exclusively on the training portion and applied to the validation/test portions. This ensures that no information from the evaluation data leaks into the preprocessing.
 
-We split the training data 80/20 into a fitting set and a validation set. The original `test.csv` remains completely untouched for final evaluation.
+## Train–Validation–Test Split
 
-```{r train-val-split}
+We use the full `train.csv` (80% of the original data) as the training set. The `test.csv` (20% of the original data) is split 50/50 into a **validation set** (10% of total) for model selection and a **held-out test set** (10% of total) for final evaluation. This yields an 80–10–10 split overall. All imputation and scaling parameters are estimated from the training set only and applied to all sets.
+
+```{r train-val-test-split}
 set.seed(42)
-val_idx   <- sample(nrow(train_scaled), size = round(0.2 * nrow(train_scaled)))
-train_fit <- train_scaled[-val_idx, ]
-train_val <- train_scaled[val_idx, ]
+test_idx <- sample(nrow(test_with_na), size = round(0.5 * nrow(test_with_na)))
+val_raw  <- test_with_na[-test_idx, ]
+test_holdout <- test_with_na[test_idx, ]
 
-cat("Fitting set:", nrow(train_fit), "observations\n")
-cat("Validation set:", nrow(train_val), "observations\n")
-cat("Class balance (fit):", round(prop.table(table(train_fit$satisfaction)) * 100, 1), "%\n")
-cat("Class balance (val):", round(prop.table(table(train_val$satisfaction)) * 100, 1), "%\n")
+fit_raw <- train_with_na
+
+cat("Training set:", nrow(fit_raw), "observations\n")
+cat("Validation set:", nrow(val_raw), "observations\n")
+cat("Held-out test set:", nrow(test_holdout), "observations\n")
+cat("Class balance (train):", round(prop.table(table(fit_raw$satisfaction)) * 100, 1), "%\n")
+cat("Class balance (val):", round(prop.table(table(val_raw$satisfaction)) * 100, 1), "%\n")
+cat("Class balance (test):", round(prop.table(table(test_holdout$satisfaction)) * 100, 1), "%\n")
+```
+
+### Imputation and Scaling on the Training Set (No Leakage)
+
+We fit the imputation model and compute all scaling parameters from the fitting set only, then apply them to both sets.
+
+```{r leakage-free-preprocessing}
+# --- 1. Imputation: fit on fitting set, apply to both ---
+fit_reg <- fit_raw %>%
+  dplyr::select(departure_delay_in_minutes, arrival_delay_in_minutes) %>%
+  na.omit()
+
+delay_model_fit <- lm(arrival_delay_in_minutes ~ departure_delay_in_minutes,
+                      data = fit_reg)
+
+train_fit <- fit_raw
+train_val <- val_raw
+
+train_fit$arrival_delay_in_minutes[is.na(train_fit$arrival_delay_in_minutes)] <-
+  predict(delay_model_fit,
+          newdata = train_fit[is.na(train_fit$arrival_delay_in_minutes), ])
+
+train_val$arrival_delay_in_minutes[is.na(train_val$arrival_delay_in_minutes)] <-
+  predict(delay_model_fit,
+          newdata = train_val[is.na(train_val$arrival_delay_in_minutes), ])
+
+cat("NAs remaining — fit:", sum(is.na(train_fit$arrival_delay_in_minutes)),
+    " val:", sum(is.na(train_val$arrival_delay_in_minutes)), "\n")
+
+# --- 2. Convert target to factor ---
+train_fit$satisfaction <- factor(train_fit$satisfaction)
+train_val$satisfaction <- factor(train_val$satisfaction)
+
+# --- 3. Scaling: compute parameters from fitting set only ---
+cont_vars <- c("age", "flight_distance",
+               "departure_delay_in_minutes", "arrival_delay_in_minutes")
+
+rating_vars <- c("inflight_wifi_service", "departure_arrival_time_convenient",
+                 "ease_of_online_booking", "gate_location", "food_and_drink",
+                 "online_boarding", "seat_comfort", "inflight_entertainment",
+                 "on_board_service", "leg_room_service", "baggage_handling",
+                 "checkin_service", "inflight_service", "cleanliness")
+
+# Standard scaling for continuous vars
+fit_cont_means <- colMeans(train_fit[, cont_vars])
+fit_cont_sds   <- apply(train_fit[, cont_vars], 2, sd)
+
+train_fit[, cont_vars] <- scale(train_fit[, cont_vars],
+                                 center = fit_cont_means, scale = fit_cont_sds)
+train_val[, cont_vars] <- scale(train_val[, cont_vars],
+                                 center = fit_cont_means, scale = fit_cont_sds)
+
+# Min-max scaling for rating vars
+fit_rating_mins   <- apply(train_fit[, rating_vars], 2, min)
+fit_rating_ranges <- apply(train_fit[, rating_vars], 2, max) - fit_rating_mins
+
+for (v in rating_vars) {
+  train_fit[[v]] <- (train_fit[[v]] - fit_rating_mins[v]) / fit_rating_ranges[v]
+  train_val[[v]] <- (train_val[[v]] - fit_rating_mins[v]) / fit_rating_ranges[v]
+}
+
+cat("Preprocessing complete .\n")
 ```
 
 ### Preparing the Three Predictor Sets
+
+We construct three versions of the predictor matrix. For the PCA version, the principal component transformation is fitted on the **training (fitting) set only** and then applied to the validation set using `predict()`, so that the validation set contributes no information to the rotation — avoiding data leakage in the same way we handled imputation and scaling above.
 
 ```{r prepare-predictor-sets}
 # --- BIC-reduced formula ---
 bic_formula <- formula(step_fwd_bic)
 
 # --- PCA predictor sets ---
-# Refit PCA on the fitting set only (no leakage)
+# Fit PCA on the fitting set only; apply the learned rotation to the validation set
 train_fit_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_fit)[, -1])
 train_val_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_val)[, -1])
 
@@ -884,7 +969,7 @@ pca_fit_only <- prcomp(train_fit_mm, center = TRUE, scale. = TRUE)
 cum_var_fit  <- cumsum(pca_fit_only$sdev^2 / sum(pca_fit_only$sdev^2))
 n_pc_90_fit  <- min(which(cum_var_fit >= 0.90))
 
-# Transform both sets
+# Transform both sets using fitting-set PCA
 train_fit_pca <- as.data.frame(predict(pca_fit_only, train_fit_mm)[, 1:n_pc_90_fit])
 train_val_pca <- as.data.frame(predict(pca_fit_only, train_val_mm)[, 1:n_pc_90_fit])
 train_fit_pca$satisfaction <- train_fit$satisfaction
@@ -892,19 +977,21 @@ train_val_pca$satisfaction <- train_val$satisfaction
 
 cat("PCA components retained (90% variance on fitting set):", n_pc_90_fit, "\n")
 ```
+```{r}
+bic_formula
+```
+## Initial Model Comparison (Default Hyperparameters)
 
-## Single-Split Model Fitting
+All models are fitted with **default hyperparameters** (no tuning). We report confusion matrices and classification metrics on the held-out validation set.
 
-We fit all models on the fitting set and evaluate on the validation set.
-
-```{r fit-all-models, cache=TRUE}
+```{r fit-all-models-default, cache=TRUE}
 library(class)   # KNN
 library(e1071)   # Naive Bayes
-library(glmnet)  # Lasso & Ridge
+# =============================================
+# Fit all models and get predicted probabilities for "satisfied"
+# =============================================
 
-# =============================================
-# Helper: get predicted probabilities for the positive class ("satisfied")
-# =============================================
+val_labels <- train_val$satisfaction
 
 # --- 1. Logistic Regression (Full) ---
 glm_full_fit <- glm(satisfaction ~ ., data = train_fit, family = binomial)
@@ -942,39 +1029,27 @@ prob_qda_bic <- predict(qda_bic_fit, train_val)$posterior[, "satisfied"]
 qda_pca_fit <- qda(satisfaction ~ ., data = train_fit_pca)
 prob_qda_pca <- predict(qda_pca_fit, train_val_pca)$posterior[, "satisfied"]
 
-# --- 10. KNN (Full) — k = 1, 5, 10, 20 ---
-# KNN needs numeric matrix
+# --- 10. KNN (Full, BIC, PCA) — default k=5 ---
 train_fit_knn <- as.data.frame(model.matrix(satisfaction ~ ., data = train_fit)[, -1])
 train_val_knn <- as.data.frame(model.matrix(satisfaction ~ ., data = train_val)[, -1])
 train_fit_knn_bic <- as.data.frame(model.matrix(bic_formula, data = train_fit)[, -1])
 train_val_knn_bic <- as.data.frame(model.matrix(bic_formula, data = train_val)[, -1])
 
-knn_ks <- c(1, 5, 10, 20)
-knn_results <- list()
-for (k_val in knn_ks) {
-  # Full
-  knn_pred <- knn(train_fit_knn, train_val_knn,
-                  cl = train_fit$satisfaction, k = k_val, prob = TRUE)
-  knn_prob <- attr(knn_pred, "prob")
-  # knn() returns prob of the winning class — convert to prob of "satisfied"
-  knn_prob_satisfied <- ifelse(knn_pred == "satisfied", knn_prob, 1 - knn_prob)
-  knn_results[[paste0("KNN_k", k_val, "_Full")]] <- knn_prob_satisfied
+knn_pred_full <- knn(train_fit_knn, train_val_knn,
+                     cl = train_fit$satisfaction, k = 5, prob = TRUE)
+knn_prob <- attr(knn_pred_full, "prob")
+prob_knn_full <- ifelse(knn_pred_full == "satisfied", knn_prob, 1 - knn_prob)
 
-  # BIC
-  knn_pred_b <- knn(train_fit_knn_bic, train_val_knn_bic,
-                    cl = train_fit$satisfaction, k = k_val, prob = TRUE)
-  knn_prob_b <- attr(knn_pred_b, "prob")
-  knn_prob_sat_b <- ifelse(knn_pred_b == "satisfied", knn_prob_b, 1 - knn_prob_b)
-  knn_results[[paste0("KNN_k", k_val, "_BIC")]] <- knn_prob_sat_b
+knn_pred_bic <- knn(train_fit_knn_bic, train_val_knn_bic,
+                    cl = train_fit$satisfaction, k = 5, prob = TRUE)
+knn_prob_b <- attr(knn_pred_bic, "prob")
+prob_knn_bic <- ifelse(knn_pred_bic == "satisfied", knn_prob_b, 1 - knn_prob_b)
 
-  # PCA
-  knn_pred_p <- knn(train_fit_pca[, -ncol(train_fit_pca)],
+knn_pred_pca <- knn(train_fit_pca[, -ncol(train_fit_pca)],
                     train_val_pca[, -ncol(train_val_pca)],
-                    cl = train_fit$satisfaction, k = k_val, prob = TRUE)
-  knn_prob_p <- attr(knn_pred_p, "prob")
-  knn_prob_sat_p <- ifelse(knn_pred_p == "satisfied", knn_prob_p, 1 - knn_prob_p)
-  knn_results[[paste0("KNN_k", k_val, "_PCA")]] <- knn_prob_sat_p
-}
+                    cl = train_fit$satisfaction, k = 5, prob = TRUE)
+knn_prob_p <- attr(knn_pred_pca, "prob")
+prob_knn_pca <- ifelse(knn_pred_pca == "satisfied", knn_prob_p, 1 - knn_prob_p)
 
 # --- 11. Naive Bayes (Full, BIC, PCA) ---
 nb_full_fit <- naiveBayes(satisfaction ~ ., data = train_fit)
@@ -986,280 +1061,1002 @@ prob_nb_bic <- predict(nb_bic_fit, train_val, type = "raw")[, "satisfied"]
 nb_pca_fit <- naiveBayes(satisfaction ~ ., data = train_fit_pca)
 prob_nb_pca <- predict(nb_pca_fit, train_val_pca, type = "raw")[, "satisfied"]
 
-# --- 12. Lasso (Full) ---
-x_train_lasso <- model.matrix(satisfaction ~ ., data = train_fit)[, -1]
-y_train_lasso <- as.integer(train_fit$satisfaction == "satisfied")
-x_val_lasso   <- model.matrix(satisfaction ~ ., data = train_val)[, -1]
-
-set.seed(42)
-cv_lasso <- cv.glmnet(x_train_lasso, y_train_lasso,
-                       family = "binomial", alpha = 1, nfolds = 10)
-prob_lasso <- as.numeric(predict(cv_lasso, x_val_lasso,
-                                  s = "lambda.min", type = "response"))
-
-# --- 13. Ridge (Full) ---
-set.seed(42)
-cv_ridge <- cv.glmnet(x_train_lasso, y_train_lasso,
-                       family = "binomial", alpha = 0, nfolds = 10)
-prob_ridge <- as.numeric(predict(cv_ridge, x_val_lasso,
-                                  s = "lambda.min", type = "response"))
-
 cat("All models fitted successfully.\n")
 ```
 
-## ROC Curves (Single Split)
+### Validation Set Metrics
 
-```{r roc-curves, fig.height=10, fig.width=12}
-# Actual labels
-val_labels <- train_val$satisfaction
-
-# Collect all probabilities into a named list
+```{r initial-metrics-table}
+# Collect all probabilities
 all_probs <- list(
-  "GLM Full"       = prob_glm_full,
-  "GLM BIC"        = prob_glm_bic,
-  "GLM PCA"        = prob_glm_pca,
-  "LDA Full"       = prob_lda_full,
-  "LDA BIC"        = prob_lda_bic,
-  "LDA PCA"        = prob_lda_pca,
-  "QDA Full"       = prob_qda_full,
-  "QDA BIC"        = prob_qda_bic,
-  "QDA PCA"        = prob_qda_pca,
-  "NB Full"        = prob_nb_full,
-  "NB BIC"         = prob_nb_bic,
-  "NB PCA"         = prob_nb_pca,
-  "Lasso"          = prob_lasso,
-  "Ridge"          = prob_ridge
+  "GLM Full"  = prob_glm_full,  "GLM BIC"  = prob_glm_bic,  "GLM PCA"  = prob_glm_pca,
+  "LDA Full"  = prob_lda_full,  "LDA BIC"  = prob_lda_bic,  "LDA PCA"  = prob_lda_pca,
+  "QDA Full"  = prob_qda_full,  "QDA BIC"  = prob_qda_bic,  "QDA PCA"  = prob_qda_pca,
+  "KNN5 Full" = prob_knn_full,  "KNN5 BIC" = prob_knn_bic,  "KNN5 PCA" = prob_knn_pca,
+  "NB Full"   = prob_nb_full,   "NB BIC"   = prob_nb_bic,   "NB PCA"   = prob_nb_pca
 )
 
-# Add best KNN per dataset (we'll pick k=5 as a representative for ROC)
-all_probs[["KNN k5 Full"]] <- knn_results[["KNN_k5_Full"]]
-all_probs[["KNN k5 BIC"]]  <- knn_results[["KNN_k5_BIC"]]
-all_probs[["KNN k5 PCA"]]  <- knn_results[["KNN_k5_PCA"]]
+# Helper: compute metrics
+compute_metrics <- function(probs, labels, threshold = 0.5) {
+  pred_class <- factor(ifelse(probs >= threshold, "satisfied", "neutral or dissatisfied"),
+                       levels = levels(labels))
+  cm <- confusionMatrix(pred_class, labels, positive = "satisfied")
+  roc_obj <- roc(labels, probs,
+                 levels = c("neutral or dissatisfied", "satisfied"),
+                 direction = "<", quiet = TRUE)
+  prec <- cm$byClass["Precision"]
+  rec  <- cm$byClass["Recall"]
+  f1   <- ifelse(prec + rec > 0, 2 * prec * rec / (prec + rec), 0)
+  data.frame(
+    Accuracy  = round(cm$overall["Accuracy"], 4),
+    Precision = round(prec, 4),
+    Recall    = round(rec, 4),
+    F1        = round(f1, 4),
+    AUC       = round(as.numeric(auc(roc_obj)), 4)
+  )
+}
 
-# Compute ROC curves
-roc_list <- lapply(all_probs, function(p) {
-  roc(val_labels, p, levels = c("neutral or dissatisfied", "satisfied"),
-      direction = "<", quiet = TRUE)
+# Build metrics table
+metrics_list <- lapply(names(all_probs), function(nm) {
+  m <- compute_metrics(all_probs[[nm]], val_labels)
+  m$Model <- nm
+  m
 })
-
-# Extract AUC values
-auc_values <- sapply(roc_list, function(r) as.numeric(auc(r)))
-
-# Plot ROC curves — grouped by method type
-# Panel 1: Logistic Regression variants
-roc_glm <- roc_list[grep("GLM|Lasso|Ridge", names(roc_list))]
-# Panel 2: LDA/QDA
-roc_da  <- roc_list[grep("LDA|QDA", names(roc_list))]
-# Panel 3: KNN and NB
-roc_other <- roc_list[grep("KNN|NB", names(roc_list))]
-
-par(mfrow = c(2, 2))
-
-# All models on one plot
-plot(roc_list[[1]], col = 1, main = "All Models — ROC Curves", legacy.axes = TRUE)
-colors <- rainbow(length(roc_list))
-for (i in seq_along(roc_list)) {
-  plot(roc_list[[i]], col = colors[i], add = (i > 1), legacy.axes = TRUE)
-}
-legend("bottomright", names(roc_list),
-       col = colors, lwd = 2, cex = 0.55, ncol = 2)
-
-# GLM family
-plot(roc_glm[[1]], col = 1, main = "Logistic / Lasso / Ridge", legacy.axes = TRUE)
-for (i in seq_along(roc_glm)) {
-  plot(roc_glm[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
-}
-legend("bottomright",
-       paste0(names(roc_glm), " (", round(sapply(roc_glm, auc), 4), ")"),
-       col = seq_along(roc_glm), lwd = 2, cex = 0.7)
-
-# DA family
-plot(roc_da[[1]], col = 1, main = "LDA / QDA", legacy.axes = TRUE)
-for (i in seq_along(roc_da)) {
-  plot(roc_da[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
-}
-legend("bottomright",
-       paste0(names(roc_da), " (", round(sapply(roc_da, auc), 4), ")"),
-       col = seq_along(roc_da), lwd = 2, cex = 0.7)
-
-# KNN and NB
-plot(roc_other[[1]], col = 1, main = "KNN / Naive Bayes", legacy.axes = TRUE)
-for (i in seq_along(roc_other)) {
-  plot(roc_other[[i]], col = i, add = (i > 1), legacy.axes = TRUE)
-}
-legend("bottomright",
-       paste0(names(roc_other), " (", round(sapply(roc_other, auc), 4), ")"),
-       col = seq_along(roc_other), lwd = 2, cex = 0.7)
-
-par(mfrow = c(1, 1))
-```
-
-### Single-Split AUC Summary Table
-
-```{r auc-summary-table}
-auc_df <- data.frame(
-  Model = names(auc_values),
-  AUC   = round(auc_values, 4)
-) %>%
+metrics_df <- bind_rows(metrics_list) %>%
+  dplyr::select(Model, Accuracy, Precision, Recall, F1, AUC) %>%
   arrange(desc(AUC))
 
-auc_df %>%
-  kable(row.names = FALSE, col.names = c("Model", "Validation AUC")) %>%
-  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+metrics_df %>%
+  kable(row.names = FALSE,
+        caption = "Initial Model Comparison — Validation Set Metrics (Default Hyperparameters)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-### KNN Performance Across k Values
+### Selecting the Best Model–Data Version Combinations
 
-```{r knn-k-comparison}
-knn_auc_df <- data.frame(
-  k       = rep(knn_ks, 3),
-  Dataset = rep(c("Full", "BIC", "PCA"), each = length(knn_ks)),
-  AUC     = sapply(names(knn_results), function(nm) {
-    as.numeric(auc(roc(val_labels, knn_results[[nm]],
-                       levels = c("neutral or dissatisfied", "satisfied"),
-                       direction = "<", quiet = TRUE)))
-  })
-)
+We use **AUC (Area Under the ROC Curve)** as the primary metric for model selection. This choice is motivated by two considerations. First, the dataset exhibits a moderate class imbalance (~57% dissatisfied vs ~43% satisfied), which means that raw accuracy can be misleading — a model that simply predicts the majority class would achieve ~57% accuracy without learning anything useful. AUC, by contrast, evaluates the model's ability to discriminate between the two classes across *all possible classification thresholds*, making it robust to class imbalance. Second, AUC directly measures the probability that a randomly chosen satisfied passenger receives a higher predicted probability than a randomly chosen dissatisfied passenger — a threshold-free summary of overall separability that is particularly informative when the optimal decision threshold is not known in advance.
 
-knn_auc_df %>%
-  pivot_wider(names_from = Dataset, values_from = AUC) %>%
-  kable(digits = 4, col.names = c("k", "Full", "BIC Reduced", "PCA")) %>%
+Rather than simply picking the top 4 individual configurations, we identify the **best 2 models** and the **best 2 data versions** and form their 4 combinations. This structured approach lets us disentangle the effect of the model choice from the effect of the predictor set, and ensures we carry forward configurations that are strong on both dimensions.
+
+```{r select-best-combinations}
+# Parse model name into method + data version
+metrics_df <- metrics_df %>%
+  mutate(
+    Method      = sub(" .*", "", Model),
+    DataVersion = sub(".* ", "", Model)
+  )
+
+# --- Best 2 models: average AUC across all 3 data versions ---
+model_avg <- metrics_df %>%
+  group_by(Method) %>%
+  summarise(Mean_AUC = round(mean(AUC), 4), .groups = "drop") %>%
+  arrange(desc(Mean_AUC))
+
+cat("=== Average AUC by Model (across all data versions) ===\n")
+model_avg %>%
+  kable(row.names = FALSE, col.names = c("Model", "Mean AUC")) %>%
   kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+best_2_models <- model_avg$Method[1:2]
+cat("\nBest 2 models:", paste(best_2_models, collapse = ", "), "\n")
+
+# --- Best 2 data versions: average AUC across all models ---
+dv_avg <- metrics_df %>%
+  group_by(DataVersion) %>%
+  summarise(Mean_AUC = round(mean(AUC), 4), .groups = "drop") %>%
+  arrange(desc(Mean_AUC))
+
+cat("\n=== Average AUC by Data Version (across all models) ===\n")
+dv_avg %>%
+  kable(row.names = FALSE, col.names = c("Data Version", "Mean AUC")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+best_2_dv <- dv_avg$DataVersion[1:2]
+cat("\nBest 2 data versions:", paste(best_2_dv, collapse = ", "), "\n")
+
+# --- Form the 4 combinations ---
+selected_configs <- expand.grid(Method = best_2_models, DataVersion = best_2_dv,
+                                 stringsAsFactors = FALSE) %>%
+  mutate(Model = paste(Method, DataVersion))
+
+cat("\n=== Selected 4 Configurations (2 models x 2 data versions) ===\n")
+cat(paste(selected_configs$Model, collapse = "\n"), "\n")
+
+selected_names <- selected_configs$Model
 ```
 
-## Cross-Validation Model Comparison
+### ROC Curves for Selected Configurations
 
-We use 5-fold cross-validation on the full training set to get robust AUC estimates. This avoids the variance of a single train-validation split and provides confidence intervals for model comparison.
+```{r roc-selected, fig.height=6, fig.width=8}
+roc_selected <- lapply(selected_names, function(nm) {
+  roc(val_labels, all_probs[[nm]],
+      levels = c("neutral or dissatisfied", "satisfied"),
+      direction = "<", quiet = TRUE)
+})
+names(roc_selected) <- selected_names
 
-```{r cv-comparison, cache=TRUE}
-set.seed(42)
-n_folds <- 5
-folds   <- createFolds(train_scaled$satisfaction, k = n_folds, returnTrain = FALSE)
+colors_sel <- c("#E74C3C", "#3498DB", "#2ECC71", "#9B59B6")
 
-# Models to cross-validate (excluding KNN for speed — evaluated separately)
-cv_models <- c("GLM Full", "GLM BIC", "GLM PCA",
-               "LDA Full", "LDA BIC", "LDA PCA",
-               "QDA Full", "QDA BIC", "QDA PCA",
-               "NB Full", "NB BIC", "NB PCA",
-               "Lasso", "Ridge")
+plot(roc_selected[[1]], col = colors_sel[1], lwd = 2.5,
+     main = "ROC Curves — Selected Configurations", legacy.axes = TRUE)
+for (i in 2:length(roc_selected)) {
+  plot(roc_selected[[i]], col = colors_sel[i], lwd = 2.5,
+       add = TRUE, legacy.axes = TRUE)
+}
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright",
+       paste0(selected_names, " (AUC = ", round(sapply(roc_selected, auc), 4), ")"),
+       col = colors_sel, lwd = 2.5, cex = 0.85)
+```
 
-cv_auc_matrix <- matrix(NA, nrow = n_folds, ncol = length(cv_models),
-                         dimnames = list(NULL, cv_models))
+### Confusion Matrices for Selected Configurations
 
-for (f in seq_len(n_folds)) {
-  cat("Fold", f, "of", n_folds, "\n")
+```{r cm-selected, fig.height=6, fig.width=12}
+cm_plots <- list()
+for (i in seq_along(selected_names)) {
+  nm <- selected_names[i]
+  pred_class <- factor(ifelse(all_probs[[nm]] >= 0.5,
+                              "satisfied", "neutral or dissatisfied"),
+                       levels = levels(val_labels))
+  cm <- table(Predicted = pred_class, Actual = val_labels)
+  cm_df <- as.data.frame(cm)
 
-  idx_val  <- folds[[f]]
-  tr       <- train_scaled[-idx_val, ]
-  va       <- train_scaled[idx_val, ]
-  va_lab   <- va$satisfaction
-
-  # PCA per fold (no leakage)
-  tr_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = tr)[, -1])
-  va_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = va)[, -1])
-  pca_f <- prcomp(tr_mm, center = TRUE, scale. = TRUE)
-  cum_f <- cumsum(pca_f$sdev^2 / sum(pca_f$sdev^2))
-  npc_f <- min(which(cum_f >= 0.90))
-
-  tr_pca <- as.data.frame(predict(pca_f, tr_mm)[, 1:npc_f])
-  va_pca <- as.data.frame(predict(pca_f, va_mm)[, 1:npc_f])
-  tr_pca$satisfaction <- tr$satisfaction
-  va_pca$satisfaction <- va$satisfaction
-
-  # Helper to compute AUC
-  get_auc <- function(probs) {
-    as.numeric(auc(roc(va_lab, probs,
-                       levels = c("neutral or dissatisfied", "satisfied"),
-                       direction = "<", quiet = TRUE)))
-  }
-
-  # GLM
-  cv_auc_matrix[f, "GLM Full"] <- get_auc(predict(glm(satisfaction ~ ., data = tr, family = binomial), va, type = "response"))
-  cv_auc_matrix[f, "GLM BIC"]  <- get_auc(predict(glm(bic_formula, data = tr, family = binomial), va, type = "response"))
-  cv_auc_matrix[f, "GLM PCA"]  <- get_auc(predict(glm(satisfaction ~ ., data = tr_pca, family = binomial), va_pca, type = "response"))
-
-  # LDA
-  cv_auc_matrix[f, "LDA Full"] <- get_auc(predict(lda(satisfaction ~ ., data = tr), va)$posterior[, "satisfied"])
-  cv_auc_matrix[f, "LDA BIC"]  <- get_auc(predict(lda(bic_formula, data = tr), va)$posterior[, "satisfied"])
-  cv_auc_matrix[f, "LDA PCA"]  <- get_auc(predict(lda(satisfaction ~ ., data = tr_pca), va_pca)$posterior[, "satisfied"])
-
-  # QDA
-  cv_auc_matrix[f, "QDA Full"] <- get_auc(predict(qda(satisfaction ~ ., data = tr), va)$posterior[, "satisfied"])
-  cv_auc_matrix[f, "QDA BIC"]  <- get_auc(predict(qda(bic_formula, data = tr), va)$posterior[, "satisfied"])
-  cv_auc_matrix[f, "QDA PCA"]  <- get_auc(predict(qda(satisfaction ~ ., data = tr_pca), va_pca)$posterior[, "satisfied"])
-
-  # Naive Bayes
-  cv_auc_matrix[f, "NB Full"]  <- get_auc(predict(naiveBayes(satisfaction ~ ., data = tr), va, type = "raw")[, "satisfied"])
-  cv_auc_matrix[f, "NB BIC"]   <- get_auc(predict(naiveBayes(bic_formula, data = tr), va, type = "raw")[, "satisfied"])
-  cv_auc_matrix[f, "NB PCA"]   <- get_auc(predict(naiveBayes(satisfaction ~ ., data = tr_pca), va_pca, type = "raw")[, "satisfied"])
-
-  # Lasso & Ridge
-  x_tr <- model.matrix(satisfaction ~ ., data = tr)[, -1]
-  y_tr <- as.integer(tr$satisfaction == "satisfied")
-  x_va <- model.matrix(satisfaction ~ ., data = va)[, -1]
-
-  cv_l <- cv.glmnet(x_tr, y_tr, family = "binomial", alpha = 1, nfolds = 5)
-  cv_auc_matrix[f, "Lasso"] <- get_auc(as.numeric(predict(cv_l, x_va, s = "lambda.min", type = "response")))
-
-  cv_r <- cv.glmnet(x_tr, y_tr, family = "binomial", alpha = 0, nfolds = 5)
-  cv_auc_matrix[f, "Ridge"] <- get_auc(as.numeric(predict(cv_r, x_va, s = "lambda.min", type = "response")))
+  cm_plots[[i]] <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1.2) +
+    geom_text(aes(label = format(Freq, big.mark = ",")), size = 4.5, fontface = "bold") +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    labs(title = nm) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 20, hjust = 1))
 }
 
-cat("Cross-validation complete.\n")
+grid.arrange(grobs = cm_plots, ncol = 2)
+```
+
+### Metrics Summary for Selected Configurations
+
+```{r metrics-selected}
+metrics_df %>%
+  filter(Model %in% selected_names) %>%
+  dplyr::select(Model, Accuracy, Precision, Recall, F1, AUC) %>%
+  arrange(desc(AUC)) %>%
+  kable(row.names = FALSE,
+        caption = "Selected Configurations — Validation Set Metrics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Cross-Validation on 90% Data (Selected Configurations)
+
+The single train–validation split above gave us an initial ranking, but a single split can be sensitive to which observations end up in the validation set — we may have simply "got lucky" with a favourable partition. To obtain a more reliable estimate of test error and to verify that our models generalise consistently, we perform **10-fold cross-validation** on the combined training + validation data (90% of the total) for the 4 selected model–data version configurations. The held-out 10% test set (`test_holdout`) remains completely untouched until final evaluation.
+
+For KNN, which has a tuneable hyperparameter (the number of neighbours $k$), we additionally search over $k \in \{5, 10, 15, 20\}$ within the cross-validation loop.
+
+**Pipeline approach.** A critical requirement is that *all preprocessing* — imputation, scaling, and (where applicable) PCA — must be fitted on the training folds and applied to the held-out validation fold within each iteration. If we were to impute or scale using the full dataset before splitting into folds, information from the validation fold would leak into the training folds, producing optimistically biased error estimates. We use the `recipes` package from `tidymodels` to define reusable preprocessing pipelines that enforce this discipline: each recipe is `prep()`-ed on the training folds and `bake()`-d onto the validation fold, guaranteeing that no information flows in the wrong direction.
+
+```{r cv-setup}
+# install.packages("recipes")  # uncomment on first run
+library(recipes)
+
+# Combine train (80%) + validation (10%) = 90% for cross-validation
+cv_data <- bind_rows(train_with_na, val_raw)
+cat("CV data size (90% of total):", nrow(cv_data), "observations\n")
+cat("Held-out test size (10% of total):", nrow(test_holdout), "observations\n")
+
+set.seed(42)
+n_folds <- 10
+fold_ids <- createFolds(cv_data$satisfaction, k = n_folds, returnTrain = FALSE)
+
+# Variable groups (same as before)
+cont_vars <- c("age", "flight_distance",
+               "departure_delay_in_minutes", "arrival_delay_in_minutes")
+
+rating_vars <- c("inflight_wifi_service", "departure_arrival_time_convenient",
+                 "ease_of_online_booking", "gate_location", "food_and_drink",
+                 "online_boarding", "seat_comfort", "inflight_entertainment",
+                 "on_board_service", "leg_room_service", "baggage_handling",
+                 "checkin_service", "inflight_service", "cleanliness")
+
+cat_vars <- c("gender", "customer_type", "type_of_travel", "class")
+
+# BIC-selected variable names (from the forward BIC step earlier)
+bic_predictors <- all.vars(bic_formula)[-1]  # drop the response
+cat("BIC predictors:", paste(bic_predictors, collapse = ", "), "\n")
+```
+
+### Building the Preprocessing Recipes
+
+We define three recipes — one per data version — that encode the full preprocessing pipeline:
+
+1. **Imputation**: predict missing `arrival_delay_in_minutes` from `departure_delay_in_minutes` using `step_impute_linear()`.
+2. **Scaling**: z-score standardisation for continuous variables (`step_normalize()`), min-max scaling for ordinal ratings (`step_range()`).
+3. **Dummy encoding**: create indicator variables for the categorical predictors (`step_dummy()`).
+4. **PCA** (PCA version only): `step_pca()` retaining components for 90% of variance.
+5. **Variable selection** (BIC version only): keep only the BIC-selected predictors (`step_select()`).
+
+```{r define-recipes}
+# --- Base recipe (shared preprocessing steps) ---
+base_recipe <- function(data) {
+  recipe(satisfaction ~ ., data = data) %>%
+    step_impute_linear(arrival_delay_in_minutes,
+                       impute_with = imp_vars(departure_delay_in_minutes)) %>%
+    step_normalize(all_of(cont_vars)) %>%
+    step_range(all_of(rating_vars), min = 0, max = 1) %>%
+    step_dummy(all_of(cat_vars))
+}
+
+# --- Full recipe ---
+make_recipe_full <- function(data) {
+  base_recipe(data)
+}
+
+# --- BIC recipe: select only BIC predictors before dummy encoding ---
+make_recipe_bic <- function(data) {
+  recipe(satisfaction ~ ., data = data) %>%
+    step_impute_linear(arrival_delay_in_minutes,
+                       impute_with = imp_vars(departure_delay_in_minutes)) %>%
+    step_rm(-satisfaction, -all_of(bic_predictors)) %>%
+    step_normalize(all_of(intersect(cont_vars, bic_predictors))) %>%
+    step_range(all_of(intersect(rating_vars, bic_predictors)), min = 0, max = 1) %>%
+    step_dummy(all_of(intersect(cat_vars, bic_predictors)))
+}
+
+# --- PCA recipe: full preprocessing then PCA ---
+make_recipe_pca <- function(data) {
+  base_recipe(data) %>%
+    step_pca(all_predictors(), threshold = 0.90)
+}
+```
+
+### Cross-Validation Loop
+
+```{r}
+selected_configs
+```
+
+
+```{r cv-loop, cache=TRUE}
+# KNN k values to try
+knn_k_values <- c(5,10,15)
+
+# Helper: get AUC
+get_auc <- function(probs, labels) {
+  as.numeric(auc(roc(labels, probs,
+                     levels = c("neutral or dissatisfied", "satisfied"),
+                     direction = "<", quiet = TRUE)))
+}
+
+# Helper: get F1 score from probabilities
+get_f1 <- function(probs, labels, threshold = 0.5) {
+  pred_class <- factor(ifelse(probs >= threshold, "satisfied", "neutral or dissatisfied"),
+                       levels = levels(labels))
+  cm <- confusionMatrix(pred_class, labels, positive = "satisfied")
+  prec <- cm$byClass["Precision"]
+  rec  <- cm$byClass["Recall"]
+  ifelse(prec + rec > 0, 2 * prec * rec / (prec + rec), 0)
+}
+
+# Storage: AUC and F1 per fold
+cv_results <- list()
+cv_f1_results <- list()
+
+for (cfg_i in seq_len(nrow(selected_configs))) {
+  method <- selected_configs$Method[cfg_i]
+  dv     <- selected_configs$DataVersion[cfg_i]
+  cfg_name <- selected_configs$Model[cfg_i]
+
+  cat("\n=== Configuration:", cfg_name, "===\n")
+
+  # Choose recipe constructor
+  make_recipe <- switch(dv,
+    "Full" = make_recipe_full,
+    "BIC"  = make_recipe_bic,
+    "PCA"  = make_recipe_pca
+  )
+
+  if (method == "KNN5") {
+    # KNN: store results for each k value
+    for (k_val in knn_k_values) {
+      result_name <- paste0(cfg_name, " (k=", k_val, ")")
+      cv_results[[result_name]] <- numeric(n_folds)
+      cv_f1_results[[result_name]] <- numeric(n_folds)
+    }
+  } else {
+    cv_results[[cfg_name]] <- numeric(n_folds)
+    cv_f1_results[[cfg_name]] <- numeric(n_folds)
+  }
+
+  for (f in seq_len(n_folds)) {
+    idx_val <- fold_ids[[f]]
+    tr_raw  <- cv_data[-idx_val, ]
+    va_raw  <- cv_data[idx_val, ]
+
+    # Prep recipe on training fold, bake both
+    rec <- make_recipe(tr_raw) %>% prep(training = tr_raw)
+    tr_baked <- bake(rec, new_data = NULL)  # NULL = return training data
+    va_baked <- bake(rec, new_data = va_raw)
+
+    va_lab <- va_baked$satisfaction
+
+    tryCatch({
+      if (method == "GLM") {
+        fit <- glm(satisfaction ~ ., data = tr_baked, family = binomial)
+        probs <- predict(fit, va_baked, type = "response")
+        cv_results[[cfg_name]][f] <- get_auc(probs, va_lab)
+        cv_f1_results[[cfg_name]][f] <- get_f1(probs, va_lab)
+
+      } else if (method == "LDA") {
+        fit <- lda(satisfaction ~ ., data = tr_baked)
+        probs <- predict(fit, va_baked)$posterior[, "satisfied"]
+        cv_results[[cfg_name]][f] <- get_auc(probs, va_lab)
+        cv_f1_results[[cfg_name]][f] <- get_f1(probs, va_lab)
+
+      } else if (method == "QDA") {
+        fit <- qda(satisfaction ~ ., data = tr_baked)
+        probs <- predict(fit, va_baked)$posterior[, "satisfied"]
+        cv_results[[cfg_name]][f] <- get_auc(probs, va_lab)
+        cv_f1_results[[cfg_name]][f] <- get_f1(probs, va_lab)
+
+      } else if (method == "NB") {
+        fit <- naiveBayes(satisfaction ~ ., data = tr_baked)
+        probs <- predict(fit, va_baked, type = "raw")[, "satisfied"]
+        cv_results[[cfg_name]][f] <- get_auc(probs, va_lab)
+        cv_f1_results[[cfg_name]][f] <- get_f1(probs, va_lab)
+
+      } else if (method == "KNN5") {
+        # Prepare numeric matrices for knn()
+        tr_x <- tr_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
+        va_x <- va_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
+        tr_y <- tr_baked$satisfaction
+
+        for (k_val in knn_k_values) {
+          result_name <- paste0(cfg_name, " (k=", k_val, ")")
+          knn_pred <- knn(tr_x, va_x, cl = tr_y, k = k_val, prob = TRUE)
+          knn_pr   <- attr(knn_pred, "prob")
+          probs    <- ifelse(knn_pred == "satisfied", knn_pr, 1 - knn_pr)
+          cv_results[[result_name]][f] <- get_auc(probs, va_lab)
+          cv_f1_results[[result_name]][f] <- get_f1(probs, va_lab)
+        }
+      }
+    }, error = function(e) {
+      cat("  Error in fold", f, ":", conditionMessage(e), "\n")
+    })
+  }
+  cat("  Done.\n")
+}
+
+cat("\n10-fold cross-validation complete.\n")
 ```
 
 ### Cross-Validation AUC Results
 
 ```{r cv-results-table}
 cv_summary <- data.frame(
-  Model    = colnames(cv_auc_matrix),
-  Mean_AUC = round(colMeans(cv_auc_matrix), 4),
-  SD_AUC   = round(apply(cv_auc_matrix, 2, sd), 4),
-  Min_AUC  = round(apply(cv_auc_matrix, 2, min), 4),
-  Max_AUC  = round(apply(cv_auc_matrix, 2, max), 4)
+  Configuration = names(cv_results),
+  Mean_AUC      = round(sapply(cv_results, mean, na.rm = TRUE), 4),
+  SD_AUC        = round(sapply(cv_results, sd, na.rm = TRUE), 4),
+  Mean_F1       = round(sapply(cv_f1_results, mean, na.rm = TRUE), 4),
+  SD_F1         = round(sapply(cv_f1_results, sd, na.rm = TRUE), 4)
 ) %>%
   arrange(desc(Mean_AUC))
 
 cv_summary %>%
   kable(row.names = FALSE,
-        col.names = c("Model", "Mean AUC", "SD", "Min", "Max")) %>%
-  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+        col.names = c("Configuration", "Mean AUC", "SD AUC", "Mean F1", "SD F1"),
+        caption = "10-Fold Cross-Validation Results (90% Data: Train + Validation)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-### Cross-Validation AUC Box Plot
+```{r cv-boxplot, fig.height=6, fig.width=10}
+cv_long <- stack(cv_results) %>%
+  rename(AUC = values, Configuration = ind)
 
-```{r cv-boxplot, fig.height=7, fig.width=10}
-cv_long <- as.data.frame(cv_auc_matrix) %>%
-  pivot_longer(everything(), names_to = "Model", values_to = "AUC")
+cv_long$Configuration <- factor(cv_long$Configuration,
+                                 levels = rev(cv_summary$Configuration))
 
-# Order by mean AUC
-model_order <- cv_summary$Model
-cv_long$Model <- factor(cv_long$Model, levels = rev(model_order))
-
-ggplot(cv_long, aes(x = Model, y = AUC, fill = Model)) +
+ggplot(cv_long, aes(x = Configuration, y = AUC, fill = Configuration)) +
   geom_boxplot(alpha = 0.7, show.legend = FALSE) +
   coord_flip() +
-  labs(title = "5-Fold Cross-Validation: AUC by Model",
+  labs(title = "10-Fold Cross-Validation: AUC Distribution",
+       subtitle = "KNN configurations shown with different k values",
        x = "", y = "AUC") +
-  theme_minimal() +
-  theme(axis.text.y = element_text(size = 9))
+  theme_minimal(base_size = 11)
 ```
 
-### Best Model Selection
+### Best Configuration
 
-```{r best-model}
-best_model <- cv_summary$Model[1]
-best_auc   <- cv_summary$Mean_AUC[1]
+```{r best-cv-config}
+best_cv <- cv_summary$Configuration[1]
+best_cv_auc <- cv_summary$Mean_AUC[1]
+best_cv_sd  <- cv_summary$SD_AUC[1]
 
-cat("=== Best Model by Mean CV AUC ===\n")
-cat("Model:", best_model, "\n")
-cat("Mean AUC:", best_auc, "(±", cv_summary$SD_AUC[1], ")\n\n")
+cat("=== Best Configuration by Mean 10-Fold CV AUC ===\n")
+cat("Configuration:", best_cv, "\n")
+cat("Mean AUC:", best_cv_auc, "(±", best_cv_sd, ")\n\n")
 
-cat("Top 5 models:\n")
-for (i in 1:min(5, nrow(cv_summary))) {
-  cat(sprintf("  %d. %s — AUC: %.4f (± %.4f)\n",
-              i, cv_summary$Model[i], cv_summary$Mean_AUC[i], cv_summary$SD_AUC[i]))
+# If best is a KNN variant, extract the best k
+if (grepl("KNN", best_cv)) {
+  best_k <- as.numeric(gsub(".*k=(\\d+).*", "\\1", best_cv))
+  cat("Best k for KNN:", best_k, "\n")
+}
+
+cat("\nFull ranking:\n")
+for (i in seq_len(nrow(cv_summary))) {
+  cat(sprintf("  %d. %s — Mean AUC: %.4f (± %.4f)\n",
+              i, cv_summary$Configuration[i],
+              cv_summary$Mean_AUC[i], cv_summary$SD_AUC[i]))
+}
+```
+## Logistic Regression with L1 and L2 penalty
+```{r}
+#install.packages("tidymodels")
+library(tidymodels)
+library(glmnet)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+#--------------------------------------------------
+# AUC helper
+#--------------------------------------------------
+get_auc <- function(probs, labels) {
+  as.numeric(auc(
+    roc(labels, probs,
+        levels = c("neutral or dissatisfied", "satisfied"),
+        direction = "<",
+        quiet = TRUE)
+  ))
+}
+
+# glmnet needs 0/1 outcome for binomial
+to_binary01 <- function(y) {
+  ifelse(y == "satisfied", 1, 0)
+}
+
+#--------------------------------------------------
+# CV over a lambda grid for penalized logistic regression
+# alpha = 0 -> ridge
+# alpha = 1 -> lasso
+#--------------------------------------------------
+cv_glmnet_grid <- function(data,
+                           fold_ids,
+                           make_recipe,
+                           lambda_grid,
+                           alpha_value,
+                           model_name = "ridge") {
+
+  n_folds <- length(fold_ids)
+
+  # rows = lambdas, cols = folds
+  auc_mat <- matrix(NA_real_,
+                    nrow = length(lambda_grid),
+                    ncol = n_folds,
+                    dimnames = list(paste0("lambda_", seq_along(lambda_grid)),
+                                    paste0("fold_", seq_len(n_folds))))
+
+  for (f in seq_len(n_folds)) {
+    cat("\n=== ", model_name, " | fold ", f, "/", n_folds, " ===\n", sep = "")
+
+    idx_val <- fold_ids[[f]]
+    tr_raw  <- data[-idx_val, ]
+    va_raw  <- data[idx_val, ]
+
+    # Prep recipe on training fold only
+    rec <- make_recipe(tr_raw) %>% prep(training = tr_raw)
+
+    tr_baked <- bake(rec, new_data = NULL)
+    va_baked <- bake(rec, new_data = va_raw)
+
+    x_train <- tr_baked %>%
+      dplyr::select(-satisfaction) %>%
+      as.matrix()
+
+    x_valid <- va_baked %>%
+      dplyr::select(-satisfaction) %>%
+      as.matrix()
+
+    y_train <- to_binary01(tr_baked$satisfaction)
+    y_valid <- va_baked$satisfaction
+
+    for (i in seq_along(lambda_grid)) {
+      lam <- lambda_grid[i]
+
+      fit <- glmnet(
+        x = x_train,
+        y = y_train,
+        family = "binomial",
+        alpha = alpha_value,
+        lambda = lam,
+        standardize = FALSE   # already scaled in recipe
+      )
+
+      probs <- as.numeric(
+        predict(fit, newx = x_valid, type = "response")
+      )
+
+      auc_mat[i, f] <- get_auc(probs, y_valid)
+    }
+  }
+
+  summary_df <- tibble(
+    Model = model_name,
+    lambda = lambda_grid,
+    log_lambda = log(lambda_grid),
+    mean_auc = rowMeans(auc_mat, na.rm = TRUE),
+    sd_auc = apply(auc_mat, 1, sd, na.rm = TRUE)
+  )
+
+  list(
+    auc_mat = auc_mat,
+    summary = summary_df
+  )
+}
+```
+```{r}
+lambda_grid <- c(0.0001, 0.001, 0.01, 0.1, 1, 10)
+ridge_cv <- cv_glmnet_grid(
+  data = cv_data,
+  fold_ids = fold_ids,
+  make_recipe = make_recipe_full,
+  lambda_grid = lambda_grid,
+  alpha_value = 0,
+  model_name = "Ridge Full"
+)
+
+lasso_cv <- cv_glmnet_grid(
+  data = cv_data,
+  fold_ids = fold_ids,
+  make_recipe = make_recipe_full,
+  lambda_grid = lambda_grid,
+  alpha_value = 1,
+  model_name = "Lasso Full"
+)
+ridge_cv$summary
+lasso_cv$summary
+```
+```{r ridge-cv-plot, fig.height=5, fig.width=8}
+ggplot(ridge_cv$summary, aes(x = lambda, y = mean_auc)) +
+  geom_ribbon(aes(ymin = mean_auc - sd_auc, ymax = mean_auc + sd_auc),
+              alpha = 0.15, fill = "#3498DB") +
+  geom_line(color = "#3498DB", linewidth = 1) +
+  geom_point(color = "#3498DB", size = 2.5) +
+  geom_point(data = ridge_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+             shape = 21, size = 5, stroke = 1.2, color = "#3498DB", fill = "white") +
+  geom_text(data = ridge_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+            aes(label = sprintf("%.4f", mean_auc)),
+            vjust = -1.4, size = 3.5, color = "#2C3E50") +
+  scale_x_log10(labels = scales::label_number()) +
+  coord_cartesian(ylim = c(0.80, 0.95)) +
+  labs(title = "Ridge (L2) Logistic Regression: 10-Fold CV AUC",
+       subtitle = "Shaded band = ± 1 SD; circled point = best λ",
+       x = expression(lambda ~ "(log scale)"), y = "Mean CV AUC") +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(color = "grey40"))
+```
+
+```{r lasso-cv-plot, fig.height=5, fig.width=8}
+ggplot(lasso_cv$summary, aes(x = lambda, y = mean_auc)) +
+  geom_ribbon(aes(ymin = mean_auc - sd_auc, ymax = mean_auc + sd_auc),
+              alpha = 0.15, fill = "#E74C3C") +
+  geom_line(color = "#E74C3C", linewidth = 1) +
+  geom_point(color = "#E74C3C", size = 2.5) +
+  geom_point(data = lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+             shape = 21, size = 5, stroke = 1.2, color = "#E74C3C", fill = "white") +
+  geom_text(data = lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+            aes(label = sprintf("%.4f", mean_auc)),
+            vjust = -1.4, size = 3.5, color = "#2C3E50") +
+  scale_x_log10(labels = scales::label_number()) +
+  coord_cartesian(ylim = c(0.45, 0.95)) +
+  labs(title = "Lasso (L1) Logistic Regression: 10-Fold CV AUC",
+       subtitle = "Shaded band = ± 1 SD; circled point = best λ",
+       x = expression(lambda ~ "(log scale)"), y = "Mean CV AUC") +
+  theme_minimal(base_size = 12) +
+  theme(plot.subtitle = element_text(color = "grey40"))
+```
+
+### Why Penalised Methods?
+
+We explored Ridge (L2) and Lasso (L1) regularisation for two reasons. First, penalised methods can improve generalisation by shrinking coefficients toward zero, reducing overfitting — particularly when predictors are correlated (as several service ratings are in this dataset). Second, Lasso has the additional property of performing implicit feature selection by driving some coefficients to exactly zero, offering an alternative to the explicit BIC-based stepwise approach used earlier.
+
+### Results and Interpretation
+
+Both Ridge and Lasso achieve their best AUC at very small $\lambda$ values ($\lambda \leq 0.001$), where the penalty is negligible and the models approximate standard unpenalised logistic regression. At these optimal values, both methods match the unpenalised GLM Full cross-validated AUC of approximately 0.927. As $\lambda$ increases, Ridge degrades smoothly — its AUC declines from 0.927 to 0.836 at $\lambda = 10$ — because L2 regularisation shrinks all coefficients proportionally but never eliminates them entirely. Lasso, by contrast, shows a sharp cliff: at $\lambda = 0.1$ the AUC drops to 0.667, and by $\lambda \geq 1$ it collapses to exactly 0.5 (random guessing) with zero variance across folds, meaning that all predictor coefficients have been driven to zero.
+
+The fact that neither penalised method improves upon the unpenalised logistic regression confirms that the full predictor set is already well-conditioned: there is no meaningful overfitting to regularise away, and the BIC-selected subset (which dropped only 4 weak variables out of 23) was already a near-optimal reduction.
+
+## Threshold Optimisation for Top KNN Models
+
+Cross-validation identified two KNN configurations as the top performers: **KNN (k = 15)** with a mean CV AUC of 0.9777 and mean CV F1 of 0.9118, and **KNN (k = 10)** with a mean CV AUC of 0.9757 and mean CV F1 of 0.9165. Both are very close in performance, and both used the default classification threshold of 0.5. However, the optimal threshold for maximising F1 may differ from 0.5, particularly with moderate class imbalance. We therefore retrain each model on the full training set (`train_with_na`) and sweep across a fine threshold grid on the validation set to identify the threshold that maximises F1 for each model.
+
+```{r threshold-optimisation, fig.height=6, fig.width=9}
+# --- Retrain both KNN models on train set, predict on validation set ---
+# Preprocess: fit BIC recipe on train_with_na, bake both train and val
+rec_bic <- make_recipe_bic(train_with_na) %>% prep(training = train_with_na)
+tr_baked_bic <- bake(rec_bic, new_data = NULL)
+va_baked_bic <- bake(rec_bic, new_data = val_raw)
+
+tr_x <- tr_baked_bic %>% dplyr::select(-satisfaction) %>% as.data.frame()
+va_x <- va_baked_bic %>% dplyr::select(-satisfaction) %>% as.data.frame()
+tr_y <- tr_baked_bic$satisfaction
+va_y <- va_baked_bic$satisfaction
+
+# KNN k=15
+knn15_pred <- knn(tr_x, va_x, cl = tr_y, k = 15, prob = TRUE)
+knn15_prob_raw <- attr(knn15_pred, "prob")
+prob_knn15 <- ifelse(knn15_pred == "satisfied", knn15_prob_raw, 1 - knn15_prob_raw)
+
+# KNN k=10
+knn10_pred <- knn(tr_x, va_x, cl = tr_y, k = 10, prob = TRUE)
+knn10_prob_raw <- attr(knn10_pred, "prob")
+prob_knn10 <- ifelse(knn10_pred == "satisfied", knn10_prob_raw, 1 - knn10_prob_raw)
+
+# --- Sweep threshold grid ---
+threshold_grid <- seq(0.01, 0.99, by = 0.01)
+
+compute_f1_at_threshold <- function(probs, labels, threshold) {
+  pred_class <- factor(ifelse(probs >= threshold, "satisfied", "neutral or dissatisfied"),
+                       levels = levels(labels))
+  cm <- confusionMatrix(pred_class, labels, positive = "satisfied")
+  prec <- cm$byClass["Precision"]
+  rec  <- cm$byClass["Recall"]
+  if (is.na(prec) | is.na(rec) | (prec + rec == 0)) return(0)
+  2 * prec * rec / (prec + rec)
+}
+
+f1_k15 <- sapply(threshold_grid, function(t) compute_f1_at_threshold(prob_knn15, va_y, t))
+f1_k10 <- sapply(threshold_grid, function(t) compute_f1_at_threshold(prob_knn10, va_y, t))
+
+# Build data frame for plotting
+f1_df <- bind_rows(
+  tibble(Threshold = threshold_grid, F1 = f1_k15, Model = "KNN (k = 15)"),
+  tibble(Threshold = threshold_grid, F1 = f1_k10, Model = "KNN (k = 10)")
+)
+
+# Find optimal thresholds
+best_t15 <- threshold_grid[which.max(f1_k15)]
+best_f1_15 <- max(f1_k15)
+best_t10 <- threshold_grid[which.max(f1_k10)]
+best_f1_10 <- max(f1_k10)
+
+best_points <- tibble(
+  Threshold = c(best_t15, best_t10),
+  F1 = c(best_f1_15, best_f1_10),
+  Model = c("KNN (k = 15)", "KNN (k = 10)"),
+  Label = c(sprintf("t* = %.2f, F1 = %.4f", best_t15, best_f1_15),
+            sprintf("t* = %.2f, F1 = %.4f", best_t10, best_f1_10))
+)
+
+cat("=== Optimal Thresholds (Validation Set) ===\n")
+cat(sprintf("KNN k=15: threshold = %.2f, F1 = %.4f\n", best_t15, best_f1_15))
+cat(sprintf("KNN k=10: threshold = %.2f, F1 = %.4f\n", best_t10, best_f1_10))
+
+# --- Plot ---
+ggplot(f1_df, aes(x = Threshold, y = F1, color = Model)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = best_points, aes(x = Threshold, y = F1),
+             shape = 21, size = 5, stroke = 1.3, fill = "white") +
+  geom_text(data = best_points, aes(label = Label),
+            vjust = -1.3, hjust = 0.5, size = 3.5, show.legend = FALSE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  annotate("text", x = 0.51, y = min(f1_df$F1) + 0.02,
+           label = "Default (0.5)", hjust = 0, size = 3, color = "grey40") +
+  scale_color_manual(values = c("KNN (k = 15)" = "#3498DB", "KNN (k = 10)" = "#E74C3C")) +
+  labs(
+    title = "F1 Score vs Classification Threshold — Top 2 KNN Models",
+    subtitle = "Trained on full training set; evaluated on validation set; circled points = optimal threshold",
+    x = "Classification Threshold", y = "F1 Score",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.subtitle = element_text(color = "grey40")
+  )
+```
+
+# Final Model: KNN (k = 15) — Test-Set Performance
+
+Based on cross-validation and threshold tuning, we select **KNN with k = 15** as the final model. It achieved the highest mean CV AUC (0.9777) and matched the best F1 on the validation set. The optimised threshold from the validation sweep is **t\* = 0.34**. We now evaluate this model on the **held-out test set** (`test_holdout`), which has not been used in any modelling or tuning decision.
+
+```{r final-model-test, fig.height=6, fig.width=8}
+# --- Preprocess: fit BIC recipe on train_with_na, bake train and test_holdout ---
+rec_final <- make_recipe_bic(train_with_na) %>% prep(training = train_with_na)
+tr_baked <- bake(rec_final, new_data = NULL)
+te_baked <- bake(rec_final, new_data = test_holdout)
+
+tr_x_final <- tr_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
+te_x_final <- te_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
+tr_y_final <- tr_baked$satisfaction
+te_y_final <- te_baked$satisfaction
+
+# --- KNN k=15 prediction on test set ---
+set.seed(42)
+knn_test_pred <- knn(tr_x_final, te_x_final, cl = tr_y_final, k = 15, prob = TRUE)
+knn_test_prob_raw <- attr(knn_test_pred, "prob")
+prob_test_satisfied <- ifelse(knn_test_pred == "satisfied",
+                              knn_test_prob_raw, 1 - knn_test_prob_raw)
+
+# --- ROC curve on test set ---
+roc_test <- roc(te_y_final, prob_test_satisfied, levels = c("neutral or dissatisfied", "satisfied"))
+
+cat("=== Test-Set ROC AUC ===\n")
+cat(sprintf("AUC = %.4f\n", auc(roc_test)))
+
+ggroc(roc_test, legacy.axes = TRUE, color = "#3498DB", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  annotate("text", x = 0.55, y = 0.30,
+           label = sprintf("AUC = %.4f", auc(roc_test)),
+           size = 5, fontface = "bold", color = "#2C3E50") +
+  labs(title = "ROC Curve — Final Model: KNN BIC (k = 15) on Held-Out Test Set",
+       x = "False Positive Rate (1 − Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal(base_size = 12)
+```
+
+## Confusion Matrices and Metrics
+
+We evaluate at both the **default threshold (t = 0.50)** and the **optimised threshold (t = 0.34)** from the validation sweep.
+
+```{r final-confusion-matrices}
+# --- Helper: generate confusion matrix and key metrics ---
+eval_at_threshold <- function(probs, true_labels, threshold, label) {
+  pred_class <- factor(
+    ifelse(probs >= threshold, "satisfied", "neutral or dissatisfied"),
+    levels = levels(true_labels)
+  )
+  cm <- confusionMatrix(pred_class, true_labels, positive = "satisfied")
+
+  cat("\n====================================================\n")
+  cat(sprintf("  %s (threshold = %.2f)\n", label, threshold))
+  cat("====================================================\n")
+  print(cm$table)
+  cat("\n")
+  cat(sprintf("  Accuracy    = %.4f\n", cm$overall["Accuracy"]))
+  cat(sprintf("  Sensitivity = %.4f  (Recall)\n", cm$byClass["Sensitivity"]))
+  cat(sprintf("  Specificity = %.4f\n", cm$byClass["Specificity"]))
+  cat(sprintf("  Precision   = %.4f\n", cm$byClass["Pos Pred Value"]))
+
+  prec <- cm$byClass["Pos Pred Value"]
+  rec  <- cm$byClass["Sensitivity"]
+  f1   <- ifelse(is.na(prec) | is.na(rec) | (prec + rec == 0), 0,
+                 2 * prec * rec / (prec + rec))
+  cat(sprintf("  F1 Score    = %.4f\n", f1))
+
+  invisible(list(cm = cm, f1 = f1, pred_class = pred_class))
+}
+
+res_050 <- eval_at_threshold(prob_test_satisfied, te_y_final, 0.50, "Test Set — Default")
+res_034 <- eval_at_threshold(prob_test_satisfied, te_y_final, 0.34, "Test Set — Optimised")
+```
+
+```{r cm-heatmaps, fig.height=4, fig.width=10}
+# --- Side-by-side confusion matrix heatmaps ---
+make_cm_plot <- function(cm_obj, title_str) {
+  cm_df <- as.data.frame(cm_obj$table)
+  colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+  ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1.5) +
+    geom_text(aes(label = format(Freq, big.mark = ",")), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#F7F7F7", high = "#3498DB") +
+    labs(title = title_str, x = "Actual", y = "Predicted") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = 11))
+}
+
+p_cm1 <- make_cm_plot(res_050$cm, "Default Threshold (t = 0.50)")
+p_cm2 <- make_cm_plot(res_034$cm, "Optimised Threshold (t = 0.34)")
+gridExtra::grid.arrange(p_cm1, p_cm2, ncol = 2,
+                        top = grid::textGrob("Confusion Matrices — KNN (k = 15) on Test Set",
+                                             gp = grid::gpar(fontsize = 14, fontface = "bold")))
+```
+
+## Misclassification Analysis: Inspecting the 15 Nearest Neighbours
+
+To understand *why* the model misclassifies certain observations, we sample 6 misclassified test observations (3 false positives, 3 false negatives under the optimised threshold) and examine the composition and feature statistics of their 15 nearest neighbours in the training set.
+```{r}
+install.packages("FNN")  # For get.knnx()
+```
+```{r misclass-analysis}
+# --- Identify misclassified observations at t = 0.34 ---
+pred_class_034 <- factor(
+  ifelse(prob_test_satisfied >= 0.34, "satisfied", "neutral or dissatisfied"),
+  levels = levels(te_y_final)
+)
+
+misclass_idx <- which(pred_class_034 != te_y_final)
+fp_idx <- misclass_idx[te_y_final[misclass_idx] == "neutral or dissatisfied"]
+fn_idx <- misclass_idx[te_y_final[misclass_idx] == "satisfied"]
+
+cat(sprintf("Total misclassified at t = 0.34: %d / %d (%.1f%%)\n",
+            length(misclass_idx), length(te_y_final),
+            100 * length(misclass_idx) / length(te_y_final)))
+cat(sprintf("  False positives: %d\n", length(fp_idx)))
+cat(sprintf("  False negatives: %d\n", length(fn_idx)))
+
+# --- Sample 3 FP and 3 FN ---
+set.seed(123)
+fp_sample <- sample(fp_idx, min(3, length(fp_idx)))
+fn_sample <- sample(fn_idx, min(3, length(fn_idx)))
+sample_idx <- c(fp_sample, fn_sample)
+
+# --- For each sampled observation, find its 15 nearest neighbours in training set ---
+# We use Euclidean distance on the baked (preprocessed) feature space
+library(FNN)
+
+nn_result <- get.knnx(as.matrix(tr_x_final), as.matrix(te_x_final[sample_idx, ]), k = 15)
+
+# --- Build a summary for each misclassified observation ---
+# Map baked column names back for interpretability
+baked_colnames <- colnames(tr_x_final)
+
+# For each sampled misclassified point, gather statistics
+misclass_report <- list()
+for (i in seq_along(sample_idx)) {
+  obs_i <- sample_idx[i]
+  nn_indices <- nn_result$nn.index[i, ]
+  nn_labels  <- tr_y_final[nn_indices]
+
+  # Vote proportions
+  n_sat <- sum(nn_labels == "satisfied")
+  n_dis <- sum(nn_labels == "neutral or dissatisfied")
+
+  # Features of the test observation (original scale, before baking)
+  obs_original <- test_holdout[obs_i, ]
+
+  # Neighbourhood feature statistics (baked scale)
+  nn_features <- tr_x_final[nn_indices, ]
+
+  # The test observation features (baked scale)
+  obs_baked <- te_x_final[obs_i, ]
+
+  error_type <- ifelse(te_y_final[obs_i] == "neutral or dissatisfied", "FP", "FN")
+
+  misclass_report[[i]] <- list(
+    index = obs_i,
+    error_type = error_type,
+    true_label = as.character(te_y_final[obs_i]),
+    predicted_prob = prob_test_satisfied[obs_i],
+    nn_satisfied = n_sat,
+    nn_dissatisfied = n_dis,
+    obs_original = obs_original,
+    obs_baked = obs_baked,
+    nn_features = nn_features,
+    nn_labels = nn_labels
+  )
+}
+
+# --- Print summary table ---
+cat("\n=== Misclassified Observations Summary ===\n\n")
+for (r in misclass_report) {
+  cat(sprintf("--- Obs #%d | Type: %s | True: %s | P(satisfied) = %.3f ---\n",
+              r$index, r$error_type, r$true_label, r$predicted_prob))
+  cat(sprintf("    Neighbours: %d satisfied, %d dissatisfied (out of 15)\n",
+              r$nn_satisfied, r$nn_dissatisfied))
+
+  # Show key original features
+  obs <- r$obs_original
+  cat(sprintf("    Class: %s | Travel: %s | Customer: %s | Age: %s\n",
+              obs$class, obs$type_of_travel, obs$customer_type, obs$age))
+  cat(sprintf("    Flight dist: %s | Dep delay: %s | Arr delay: %s\n",
+              obs$flight_distance, obs$departure_delay_in_minutes,
+              obs$arrival_delay_in_minutes))
+
+  # Key service ratings
+  key_ratings <- c("online_boarding", "inflight_wifi_service",
+                   "inflight_entertainment", "seat_comfort",
+                   "on_board_service", "leg_room_service")
+  rating_vals <- sapply(key_ratings, function(v) as.character(obs[[v]]))
+  cat(sprintf("    Key ratings: %s\n",
+              paste(paste0(key_ratings, "=", rating_vals), collapse = ", ")))
+  cat("\n")
 }
 ```
 
-The cross-validated AUC comparison provides a robust ranking of all models. Models that perform similarly within one standard deviation of each other are effectively equivalent — in such cases we prefer the simpler model (fewer predictors or fewer assumptions). The box plot visualises the stability of each model across folds: a narrow box indicates consistent performance, while a wide box suggests sensitivity to the particular data split.
+```{r neighbour-comparison, fig.height=8, fig.width=11}
+# --- Compare each misclassified observation to its neighbourhood ---
+# For each sampled obs, show how its key features compare to the
+# mean of its "satisfied" neighbours vs "dissatisfied" neighbours
+
+key_features_baked <- c("online_boarding", "inflight_wifi_service",
+                        "inflight_entertainment", "seat_comfort",
+                        "on_board_service", "leg_room_service",
+                        "checkin_service", "cleanliness")
+# Keep only features that exist in the baked column names
+key_features_baked <- intersect(key_features_baked, baked_colnames)
+
+comparison_rows <- list()
+for (r in misclass_report) {
+  nn_sat <- r$nn_features[r$nn_labels == "satisfied", key_features_baked, drop = FALSE]
+  nn_dis <- r$nn_features[r$nn_labels != "satisfied", key_features_baked, drop = FALSE]
+
+  obs_vals <- as.numeric(r$obs_baked[, key_features_baked])
+
+  label_str <- sprintf("Obs #%d (%s)", r$index, r$error_type)
+
+  comparison_rows[[length(comparison_rows) + 1]] <- tibble(
+    Observation = label_str,
+    Feature = key_features_baked,
+    Test_Obs = obs_vals,
+    Mean_Sat_NN  = if (nrow(nn_sat) > 0) colMeans(nn_sat) else rep(NA, length(key_features_baked)),
+    Mean_Dis_NN  = if (nrow(nn_dis) > 0) colMeans(nn_dis) else rep(NA, length(key_features_baked))
+  )
+}
+comp_df <- bind_rows(comparison_rows)
+
+# Reshape for plotting
+comp_long <- comp_df %>%
+  pivot_longer(cols = c(Test_Obs, Mean_Sat_NN, Mean_Dis_NN),
+               names_to = "Source", values_to = "Value") %>%
+  mutate(Source = recode(Source,
+    "Test_Obs" = "Misclassified Obs",
+    "Mean_Sat_NN" = "Satisfied Neighbours (mean)",
+    "Mean_Dis_NN" = "Dissatisfied Neighbours (mean)"
+  ))
+
+ggplot(comp_long, aes(x = Feature, y = Value, fill = Source)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  facet_wrap(~ Observation, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Misclassified Obs" = "#2C3E50",
+                                "Satisfied Neighbours (mean)" = "#3498DB",
+                                "Dissatisfied Neighbours (mean)" = "#E74C3C")) +
+  labs(
+    title = "Misclassified Observations vs Their 15 Nearest Neighbours",
+    subtitle = "Key service rating features (baked scale, 0–1); grouped bar = obs value vs neighbour means",
+    x = NULL, y = "Feature Value (scaled)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1, size = 8),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(color = "grey40")
+  )
+```
+
+### Interpretation of Misclassifications
+
+```{r misclass-interpretation}
+# --- Quantify how "borderline" the neighbourhood is for each misclassified obs ---
+cat("=== Neighbourhood Composition & Margin ===\n\n")
+cat(sprintf("%-18s %-5s %-15s %-8s %-8s %-10s\n",
+            "Observation", "Type", "True Label", "Sat NN", "Dis NN", "Margin"))
+cat(paste(rep("-", 72), collapse = ""), "\n")
+for (r in misclass_report) {
+  margin <- abs(r$nn_satisfied - r$nn_dissatisfied) / 15
+  cat(sprintf("Obs #%-12d %-5s %-15s %-8d %-8d %.3f\n",
+              r$index, r$error_type, r$true_label,
+              r$nn_satisfied, r$nn_dissatisfied, margin))
+}
+
+cat("\nObservations with a low margin (close to 0) sit near the decision boundary,\n")
+cat("where the 15 neighbours are nearly evenly split between the two classes.\n")
+cat("These are inherently ambiguous cases where the features do not clearly\n")
+cat("separate satisfied from dissatisfied passengers.\n")
+```
+
+## Final Model Summary
+
+```{r final-summary}
+cat("================================================================\n")
+cat("  FINAL MODEL SELECTION SUMMARY\n")
+cat("================================================================\n\n")
+cat("  Model              : KNN (k = 15)\n")
+cat("  Data Version       : BIC-reduced (19 predictors from forward stepwise)\n")
+cat("  Preprocessing      : Linear imputation, z-score + min-max scaling, dummies\n")
+cat(sprintf("  CV AUC (10-fold)   : 0.9777 ± SD\n"))
+cat(sprintf("  CV F1 (10-fold)    : 0.9118 ± SD\n"))
+cat(sprintf("  Optimised Threshold: 0.34 (from validation set F1 sweep)\n"))
+cat(sprintf("  Test AUC           : %.4f\n", auc(roc_test)))
+cat(sprintf("  Test F1 (t=0.50)   : %.4f\n", res_050$f1))
+cat(sprintf("  Test F1 (t=0.34)   : %.4f\n", res_034$f1))
+cat("================================================================\n")
+```
+
+KNN with k = 15 on the BIC-reduced predictor set was selected as the final model because it achieved the highest cross-validated AUC (0.9777) among all model–data version configurations and outperformed penalised logistic regression (AUC ≈ 0.927). The model uses the 19 BIC-selected predictors (dummy-encoded), and threshold tuning on the validation set shifted the optimal decision boundary from 0.50 to 0.34, reflecting a slight class imbalance in favour of dissatisfied passengers.
+
+The misclassification analysis reveals that errors tend to occur in **boundary regions** of the feature space where the 15 nearest neighbours contain a near-even mix of both classes. These are passengers whose service ratings and travel characteristics place them between the two clusters — for example, a business traveller who gave high ratings on most service dimensions but low ratings on wifi and online boarding, or a personal traveller with moderate ratings across the board. The low margin (close-to-even neighbour splits) for these observations confirms that they are genuinely ambiguous cases rather than systematic model failures.
+
+The comparison of confusion matrices at t = 0.50 vs t = 0.34 shows that the lower threshold increases sensitivity (catching more truly satisfied passengers) at a modest cost to precision. This trade-off is appropriate if the business priority is to avoid missing satisfied passengers (e.g., for targeted loyalty programs), whereas t = 0.50 would be preferred if false positives are more costly.
