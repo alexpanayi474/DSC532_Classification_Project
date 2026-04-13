@@ -45,10 +45,33 @@ library(gridExtra)
 library(boot)
 
 set.seed(42)
+
+# --- Custom theme for report-quality plots ---
+theme_report <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) %+replace%
+    theme(
+      plot.title       = element_text(face = "bold", size = base_size + 2,
+                                      hjust = 0,
+                                      margin = ggplot2::margin(t = 0, r = 0, b = 8, l = 0)),
+      plot.subtitle    = element_text(color = "grey40", size = base_size - 1,
+                                      margin = ggplot2::margin(t = 0, r = 0, b = 10, l = 0)),
+      axis.title       = element_text(face = "bold", size = base_size),
+      axis.text        = element_text(size = base_size - 2, color = "grey30"),
+      strip.text       = element_text(face = "bold", size = base_size - 1),
+      legend.title     = element_text(face = "bold", size = base_size - 1),
+      legend.text      = element_text(size = base_size - 2),
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank(),
+      plot.margin      = ggplot2::margin(10, 10, 10, 10)
+    )
+}
+
+# Consistent colour palette
+palette_sat <- c("neutral or dissatisfied" = "#E74C3C",
+                 "satisfied"               = "#3498DB")
+palette_2   <- c("#3498DB", "#E74C3C")
 ```
-```{r}
-getwd()
-```
+
 # Data Loading and Overview
 
 The dataset contains airline passenger satisfaction survey responses. We load the pre-split training and test sets separately to preserve the integrity of the evaluation pipeline — the test set will not be touched until the final model evaluation.
@@ -60,6 +83,7 @@ test_raw  <- read_csv("test.csv")
 cat("Training set dimensions:", dim(train_raw), "\n")
 cat("Test set dimensions:", dim(test_raw), "\n")
 ```
+
 ```{r first-look}
 glimpse(train_raw)
 ```
@@ -78,7 +102,7 @@ The training set has `r nrow(train_raw)` observations and `r ncol(train_raw)` va
 
 ## Removing Identifiers and Standardising Column Names
 
-We remove the unnamed index column (`...1`) and the `id` column since they carry no predictive information, and apply `clean_names()` to ensure consistent snake_case naming throughout the analysis.
+We remove the unnamed index column (`...1`) and the `id` column since they carry no predictive information, and apply `clean_names()` to ensure consistent naming throughout the analysis.
 
 ```{r clean-names}
 train_clean <- train_raw %>%
@@ -115,11 +139,11 @@ bind_rows(
   kable_styling(bootstrap_options = "striped", full_width = FALSE)
 ```
 
-Missing values are present exclusively in `arrival_delay_in_minutes` — roughly 0.3% of both the training and test sets. This low proportion rules out systematic dropout but we still need a principled imputation strategy rather than simple deletion. Before deciding on an approach, we conduct a thorough EDA to understand the structure of the data and the relationships between all variables — in particular with `arrival_delay_in_minutes`.
+Missing values are present exclusively in `arrival_delay_in_minutes` — approximately 0.3% of both the training and test sets. Simply deleting the affected rows would discard potentially informative observations. We therefore pursue a principled imputation strategy. Before deciding on the imputation model, we first conduct a thorough EDA to understand the structure of the data and, in particular, to identify which variables are most strongly associated with `arrival_delay_in_minutes` — this evidence will guide our choice of imputation predictors.
 
 # Exploratory Data Analysis
 
-The goal of EDA is threefold: (1) understand the distributions of individual variables and their relationship with the target, (2) identify any data quality issues, and (3) gather the evidence needed to justify our imputation strategy for the missing arrival delay values.
+Before fitting any model, we conduct a thorough exploratory analysis. Understanding the structure of the data is essential for making informed modelling decisions. Our EDA serves three purposes: (1) examining the marginal distributions of predictors and their relationship with the response, (2) identifying potential data quality issues such as outliers, and (3) building the empirical justification for the imputation strategy we will apply to the missing `arrival_delay_in_minutes` values.
 
 ## Target Variable Distribution
 
@@ -131,34 +155,44 @@ train_clean %>%
   kable_styling(bootstrap_options = "striped", full_width = FALSE)
 ```
 
-```{r target-barplot, fig.height=4}
+```{r target-barplot, fig.height=5, fig.width=7}
 train_clean %>%
   count(satisfaction) %>%
-  mutate(percent = n / sum(n),
-         label = scales::percent(percent)) %>%
-  ggplot(aes(x = "", y = n, fill = satisfaction)) +
-  geom_col(width = 1) +
-  coord_polar(theta = "y") +
-  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 5) +
-  labs(title = "Passenger Satisfaction Distribution") +
-  theme_void()
+  mutate(prop = n / sum(n),
+         label = paste0(round(prop * 100, 1), "%")) %>%
+  ggplot(aes(x = reorder(satisfaction, -n), y = n, fill = satisfaction)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = palette_sat) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Distribution of Passenger Satisfaction",
+       subtitle = "Training set (n = 103,904)",
+       x = "Satisfaction Class", y = "Count") +
+  theme_report()
 ```
 
-The dataset exhibits a moderate class imbalance: approximately 56.7% of passengers are neutral or dissatisfied and 43.3% are satisfied. This imbalance is not severe enough to require resampling techniques, but it means raw accuracy can be misleading — we will prioritise F1 score, precision, recall, and AUC when comparing models.
+The response variable exhibits a moderate class imbalance: approximately 56.7% of passengers report being neutral or dissatisfied, while 43.3% report being satisfied. This degree of imbalance is not severe enough to warrant resampling techniques, but it does mean that raw classification accuracy can be misleading — a naive classifier predicting the majority class for every observation would achieve 56.7% accuracy without learning any structure from the predictors. We therefore adopt AUC as our primary model comparison metric, supplemented by F1 score, precision, and recall, to ensure that our evaluation captures a model's ability to discriminate between the two classes rather than merely reflecting the base rate.
 
 ## Distributions of Continuous Variables
 
-```{r cont-dist-overall, fig.height=5}
+```{r cont-dist-overall, fig.height=6, fig.width=10}
 train_clean %>%
   dplyr::select(age, flight_distance,
                 departure_delay_in_minutes, arrival_delay_in_minutes) %>%
   pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = dplyr::recode(variable,
+    "age" = "Age (years)",
+    "flight_distance" = "Flight Distance (miles)",
+    "departure_delay_in_minutes" = "Departure Delay (min)",
+    "arrival_delay_in_minutes" = "Arrival Delay (min)")) %>%
   ggplot(aes(x = value)) +
-  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_histogram(bins = 40, fill = "#3498DB", color = "white", alpha = 0.85) +
   facet_wrap(~ variable, scales = "free", ncol = 2) +
-  labs(title = "Distributions of Continuous Variables",
-       x = "Value", y = "Count") +
-  theme_minimal()
+  labs(title = "Marginal Distributions of Continuous Predictors",
+       subtitle = "Each panel uses an independent scale to highlight distributional shape",
+       x = NULL, y = "Frequency") +
+  theme_report() +
+  theme(strip.text = element_text(face = "bold", size = 12))
 ```
 
 **Age** is moderately spread across adults, with a slight bimodal pattern suggesting two main passenger age groups.
@@ -167,36 +201,49 @@ train_clean %>%
 
 **Departure and arrival delay** are both heavily right-skewed with a mass of near-zero values and a sparse but long upper tail. These will be examined in detail in the outlier analysis below.
 
-```{r cont-dist-by-sat, fig.height=5}
+```{r cont-dist-by-sat, fig.height=6, fig.width=10}
 train_clean %>%
   dplyr::select(satisfaction, age, flight_distance,
                 departure_delay_in_minutes, arrival_delay_in_minutes) %>%
   pivot_longer(cols = -satisfaction, names_to = "variable", values_to = "value") %>%
+  mutate(variable = dplyr::recode(variable,
+    "age" = "Age (years)",
+    "flight_distance" = "Flight Distance (miles)",
+    "departure_delay_in_minutes" = "Departure Delay (min)",
+    "arrival_delay_in_minutes" = "Arrival Delay (min)")) %>%
   ggplot(aes(x = value, fill = satisfaction)) +
-  geom_histogram(bins = 40, color = "white", alpha = 0.6, position = "identity") +
+  geom_histogram(bins = 40, color = "white", alpha = 0.55, position = "identity") +
   facet_wrap(~ variable, scales = "free", ncol = 2) +
-  labs(title = "Continuous Variable Distributions by Satisfaction Class") +
-  theme_minimal()
+  scale_fill_manual(values = palette_sat, name = "Satisfaction") +
+  labs(title = "Continuous Predictor Distributions by Satisfaction Class",
+       subtitle = "Overlaid histograms reveal where class-conditional distributions diverge",
+       x = NULL, y = "Frequency") +
+  theme_report() +
+  theme(strip.text = element_text(face = "bold", size = 12))
 ```
 
 Breaking the distributions down by satisfaction class reveals two notable patterns. First, satisfied passengers tend to be somewhat older, with the satisfied distribution shifted towards middle age. Second, satisfied passengers are more heavily concentrated among longer flights, suggesting that business travellers (who tend to fly further) drive satisfaction. Departure and arrival delays do not show a strong visual separation by class, which is consistent with the finding that most passengers experience little to no delay.
 
 ### Delay Distribution Analysis
 
-```{r delay-zoom}
+```{r delay-zoom, fig.height=5, fig.width=12}
 p_dep <- train_clean %>%
   ggplot(aes(x = departure_delay_in_minutes, fill = satisfaction)) +
-  geom_histogram(binwidth = 5, alpha = 0.6, position = "identity") +
+  geom_histogram(binwidth = 5, alpha = 0.55, position = "identity", color = "white") +
   coord_cartesian(xlim = c(0, 200)) +
-  labs(title = "Departure Delay (0–200 min)", x = "Minutes", y = "Count") +
-  theme_minimal()
+  scale_fill_manual(values = palette_sat, name = "Satisfaction") +
+  labs(title = "Departure Delay (Zoomed: 0\u2013200 min)",
+       x = "Departure Delay (minutes)", y = "Frequency") +
+  theme_report(base_size = 12)
 
 p_arr <- train_clean %>%
   ggplot(aes(x = arrival_delay_in_minutes, fill = satisfaction)) +
-  geom_histogram(binwidth = 5, alpha = 0.6, position = "identity") +
+  geom_histogram(binwidth = 5, alpha = 0.55, position = "identity", color = "white") +
   coord_cartesian(xlim = c(0, 200)) +
-  labs(title = "Arrival Delay (0–200 min)", x = "Minutes", y = "Count") +
-  theme_minimal()
+  scale_fill_manual(values = palette_sat, name = "Satisfaction") +
+  labs(title = "Arrival Delay (Zoomed: 0\u2013200 min)",
+       x = "Arrival Delay (minutes)", y = "Frequency") +
+  theme_report(base_size = 12)
 
 grid.arrange(p_dep, p_arr, ncol = 2)
 ```
@@ -277,7 +324,7 @@ While the upper tail of `flight_distance` reaches 4,983 miles, this is entirely 
 
 The 14 service attributes are measured on a discrete 1–5 scale (with 0 occasionally representing "not applicable").
 
-```{r rating-dist, fig.height=9}
+```{r rating-dist, fig.height=10, fig.width=12}
 rating_vars <- c("inflight_wifi_service", "departure_arrival_time_convenient",
                   "ease_of_online_booking", "gate_location", "food_and_drink",
                   "online_boarding", "seat_comfort", "inflight_entertainment",
@@ -287,60 +334,51 @@ rating_vars <- c("inflight_wifi_service", "departure_arrival_time_convenient",
 train_clean %>%
   dplyr::select(satisfaction, all_of(rating_vars)) %>%
   pivot_longer(cols = -satisfaction, names_to = "variable", values_to = "value") %>%
-  ggplot(aes(x = factor(value), fill = satisfaction)) +
-  geom_bar(position = "stack") +
+  count(variable, value, satisfaction) %>%                         # pre-aggregate here
+  mutate(variable = gsub("_", " ", variable) %>% tools::toTitleCase()) %>%
+  ggplot(aes(x = factor(value), y = n, fill = satisfaction)) +
+  geom_col(position = "stack", width = 0.7) +                     # geom_col on counts
   facet_wrap(~ variable, scales = "free_y", ncol = 4) +
-  labs(title = "Service Rating Distributions by Satisfaction",
-       x = "Rating (1–5)", y = "Count") +
-  theme_minimal() +
-  theme(strip.text = element_text(size = 7))
+  scale_fill_manual(values = palette_sat, name = "Satisfaction") +
+  labs(title = "Service Rating Distributions by Satisfaction Class",
+       subtitle = "Each bar is stacked by class; strong predictors show visibly different compositions at higher ratings",
+       x = "Rating (0\u20135 scale)", y = "Frequency") +
+  theme_report(base_size = 11) +
+  theme(strip.text = element_text(size = 10, face = "bold"))
 ```
 
-Most service attributes concentrate in the 3–4 range, reflecting a broadly moderate to positive perception of airline services. Notably, variables such as `inflight_entertainment`, `seat_comfort`, and `online_boarding` show a clearer split between the two satisfaction classes at the higher rating values — passengers rating these services as 4 or 5 are predominantly satisfied. Variables like `gate_location` and `departure_arrival_time_convenient` show less separation, suggesting they are weaker predictors of overall satisfaction.
+Most service attributes concentrate in the 3--4 range, reflecting a broadly moderate to positive perception of airline services. The stacked bars reveal which service dimensions have the strongest association with the response: variables such as `inflight_entertainment`, `seat_comfort`, and `online_boarding` show a visibly different class composition at the higher rating values — passengers rating these services as 4 or 5 are predominantly in the satisfied class, whereas lower ratings are dominated by the dissatisfied class. These variables are therefore expected to carry substantial discriminative power in the classification models. In contrast, variables such as `gate_location` and `departure_arrival_time_convenient` display only minor compositional differences across rating levels, suggesting they are weaker predictors and may be candidates for removal during feature selection.
 
 ## Satisfaction by Key Categorical Variables
 
-```{r satisfaction-by-cat, fig.height=7}
-p1 <- train_clean %>%
-  count(class, satisfaction) %>%
-  group_by(class) %>%
-  mutate(prop = n / sum(n)) %>%
-  ggplot(aes(x = class, y = prop, fill = satisfaction)) +
-  geom_col(position = "dodge") +
-  labs(title = "Satisfaction by Travel Class", y = "Proportion", x = "") +
-  theme_minimal()
+```{r satisfaction-by-cat, fig.height=8, fig.width=10}
+make_cat_plot <- function(data, var, title) {
+  data %>%
+    count(!!sym(var), satisfaction) %>%
+    group_by(!!sym(var)) %>%
+    mutate(prop = n / sum(n)) %>%
+    ggplot(aes(x = !!sym(var), y = prop, fill = satisfaction)) +
+    geom_col(position = "dodge", width = 0.65) +
+    scale_fill_manual(values = palette_sat, name = "Satisfaction") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = title, y = "Proportion", x = NULL) +
+    theme_report(base_size = 11) +
+    theme(legend.position = "none")
+}
 
-p2 <- train_clean %>%
-  count(type_of_travel, satisfaction) %>%
-  group_by(type_of_travel) %>%
-  mutate(prop = n / sum(n)) %>%
-  ggplot(aes(x = type_of_travel, y = prop, fill = satisfaction)) +
-  geom_col(position = "dodge") +
-  labs(title = "Satisfaction by Travel Type", y = "Proportion", x = "") +
-  theme_minimal()
+p1 <- make_cat_plot(train_clean, "class", "By Travel Class")
+p2 <- make_cat_plot(train_clean, "type_of_travel", "By Travel Purpose")
+p3 <- make_cat_plot(train_clean, "customer_type", "By Customer Type")
+p4 <- make_cat_plot(train_clean, "gender", "By Gender")
 
-p3 <- train_clean %>%
-  count(customer_type, satisfaction) %>%
-  group_by(customer_type) %>%
-  mutate(prop = n / sum(n)) %>%
-  ggplot(aes(x = customer_type, y = prop, fill = satisfaction)) +
-  geom_col(position = "dodge") +
-  labs(title = "Satisfaction by Customer Type", y = "Proportion", x = "") +
-  theme_minimal()
-
-p4 <- train_clean %>%
-  count(gender, satisfaction) %>%
-  group_by(gender) %>%
-  mutate(prop = n / sum(n)) %>%
-  ggplot(aes(x = gender, y = prop, fill = satisfaction)) +
-  geom_col(position = "dodge") +
-  labs(title = "Satisfaction by Gender", y = "Proportion", x = "") +
-  theme_minimal()
-
-grid.arrange(p1, p2, p3, p4, ncol = 2)
+grid.arrange(p1, p2, p3, p4, ncol = 2,
+             top = grid::textGrob("Satisfaction Rate by Categorical Predictors",
+                                  gp = grid::gpar(fontsize = 15, fontface = "bold")),
+             bottom = grid::textGrob("Blue = Satisfied; Red = Neutral or Dissatisfied",
+                                     gp = grid::gpar(fontsize = 10, col = "grey40")))
 ```
 
-The categorical variables reveal several strong patterns. Business class passengers are the most satisfied group by a wide margin, while Economy and Eco Plus passengers are predominantly dissatisfied — suggesting that cabin class is one of the strongest predictors in the dataset. Similarly, passengers travelling for business purposes show much higher satisfaction than those travelling for personal reasons. Loyal customers are more satisfied than disloyal customers, possibly because loyalty status correlates with business travel and premium cabin access. Gender shows only a negligible difference in satisfaction rates.
+The categorical predictors reveal substantial heterogeneity in satisfaction rates across their levels. Business class passengers are the most satisfied group by a wide margin, while Economy and Economy Plus passengers are predominantly dissatisfied — suggesting that cabin class is among the strongest predictors in the dataset. Similarly, passengers travelling for business purposes report much higher satisfaction than those on personal trips, consistent with the hypothesis that service expectations and experience differ across travel contexts. Loyal customers display higher satisfaction than disloyal customers, which may partly reflect confounding with business travel and premium cabin access rather than a pure loyalty effect. Gender, by contrast, shows virtually no difference in satisfaction rates, indicating it carries minimal discriminative power once other predictors are accounted for. These exploratory patterns motivate retaining `class`, `type_of_travel`, and `customer_type` as important categorical predictors while anticipating that `gender` may be dropped by formal variable selection procedures.
 
 ## Correlation Analysis
 
@@ -355,32 +393,35 @@ cor_mat <- cor(train_clean_num, use = "pairwise.complete.obs")
 round(cor_mat, 2)
 ```
 
-```{r corr-heatmap-numeric, fig.height=9, fig.width=10}
-corrplot(cor_mat,
+```{r corr-heatmap-numeric, fig.height=10, fig.width=11}
+corrplot::corrplot(cor_mat,
          method = "color",
          order = "hclust",
-         number.cex = 0.55,
-         tl.cex = 0.75,
-         title = "Correlation Matrix of Numeric Variables",
-         mar = c(0, 0, 1.5, 0))
+         type = "upper",
+         tl.cex = 0.8,
+         tl.col = "grey20",
+         tl.srt = 45,
+         cl.cex = 0.8,
+         title = "Pearson Correlation Matrix of Numeric Variables",
+         mar = c(0, 0, 2, 0),
+         col = colorRampPalette(c("#E74C3C", "white", "#3498DB"))(200))
 ```
 
 A few key observations from the correlation matrix:
 
-- **Departure delay and arrival delay** are almost perfectly correlated (r ≈ 0.97), confirming that the two variables are nearly interchangeable from a linear standpoint. This is the foundation for our imputation strategy.
-- **`satisfaction_num`** (the binary-encoded target, 1 = satisfied, 0 = dissatisfied) shows moderate positive correlations with several service rating variables — particularly `online_boarding`, `inflight_entertainment`, and `seat_comfort` — and a moderate positive correlation with `flight_distance`. It is essentially uncorrelated with the delay variables, suggesting that delays alone are not the primary driver of dissatisfaction in this dataset.
-- The service rating variables form a loose cluster of moderate positive inter-correlations (r ≈ 0.2–0.5), which is expected: passengers who rate one service dimension highly tend to rate others highly too. However, these correlations are not high enough to cause serious multicollinearity concerns.
+-   **Departure delay and arrival delay** are almost perfectly correlated (r ≈ 0.97), confirming that the two variables are nearly interchangeable from a linear standpoint. This is the foundation for our imputation strategy.
+-   **`satisfaction_num`** (the binary-encoded target, 1 = satisfied, 0 = dissatisfied) shows moderate positive correlations with several service rating variables — particularly `online_boarding`, `inflight_entertainment`, and `seat_comfort` — and a moderate positive correlation with `flight_distance`. It is essentially uncorrelated with the delay variables, suggesting that delays alone are not the primary driver of dissatisfaction in this dataset.
+-   The service rating variables form a loose cluster of moderate positive inter-correlations (r ≈ 0.2–0.5), which is expected: passengers who rate one service dimension highly tend to rate others highly too. However, these correlations are not high enough to cause serious multicollinearity concerns.
 
 Note: interpreting the correlation of binary variables (like `satisfaction_num`) with continuous predictors should be done with caution, as Pearson correlation assumes linearity and does not capture threshold or interaction effects.
 
-
 ## Arrival Delay: Justifying the Imputation Strategy
 
-Before imputing the ~0.3% of missing `arrival_delay_in_minutes` values, we systematically examine its relationship with every other variable. The goal is to determine the minimal sufficient predictor set for the imputation model.
+Before imputing the \~0.3% of missing `arrival_delay_in_minutes` values, we systematically examine its relationship with every other variable. The goal is to determine the minimal sufficient predictor set for the imputation model.
 
 ### Relationship with Numeric Variables
 
-```{r arrival-corr-bar, fig.height=4}
+```{r arrival-corr-bar, fig.height=6}
 arr_cors <- cor_mat["arrival_delay_in_minutes", ]
 arr_cors_df <- data.frame(
   variable = names(arr_cors),
@@ -391,43 +432,53 @@ arr_cors_df <- data.frame(
 
 ggplot(arr_cors_df, aes(x = reorder(variable, abs(correlation)),
                         y = correlation, fill = abs(correlation) > 0.1)) +
-  geom_col() +
+  geom_col(width = 0.7) +
   coord_flip() +
-  scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "tomato"),
-                    labels = c("Near-zero", "Meaningful")) +
+  scale_fill_manual(values = c("FALSE" = "#95A5A6", "TRUE" = "#E74C3C"),
+                    labels = c("|r| < 0.1 (negligible)", "|r| > 0.1 (meaningful)")) +
   labs(title = "Correlation of Arrival Delay with All Other Numeric Variables",
-       x = "", y = "Pearson r", fill = "|r| > 0.1") +
-  theme_minimal()
+       subtitle = "Only departure delay shows a practically meaningful linear association",
+       x = NULL, y = "Pearson Correlation (r)", fill = NULL) +
+  theme_report() +
+  theme(legend.position = "top")
 ```
 
-The bar chart makes the pattern unmistakably clear: `departure_delay_in_minutes` has a near-perfect correlation with `arrival_delay_in_minutes` (r ≈ 0.97), while every other numeric variable — including age, flight distance, and all 14 service ratings — has an absolute correlation effectively equal to zero (|r| < 0.05). This means that once we account for departure delay, no additional numeric variable provides meaningful predictive power for the missing arrival delay values.
+The bar chart makes the pattern unmistakably clear: `departure_delay_in_minutes` has a near-perfect correlation with `arrival_delay_in_minutes` (r ≈ 0.97), while every other numeric variable — including age, flight distance, and all 14 service ratings — has an absolute correlation effectively equal to zero (\|r\| \< 0.05). This means that once we account for departure delay, no additional numeric variable provides meaningful predictive power for the missing arrival delay values.
 
 ### Relationship with Categorical Variables
 
-```{r arrival-delay-boxplots-zoomed}
+```{r arrival-delay-boxplots-zoomed, fig.height=6, fig.width=10}
 train_clean %>%
   dplyr::select(arrival_delay_in_minutes, satisfaction, gender,
                 customer_type, type_of_travel, class) %>%
   pivot_longer(-arrival_delay_in_minutes,
                names_to = "variable", values_to = "category") %>%
+  mutate(variable = recode(variable,
+    "satisfaction" = "Satisfaction",
+    "gender" = "Gender",
+    "customer_type" = "Customer Type",
+    "type_of_travel" = "Travel Purpose",
+    "class" = "Cabin Class")) %>%
   ggplot(aes(x = category, y = arrival_delay_in_minutes, fill = category)) +
-  geom_boxplot(outlier.alpha = 0.1) +
+  geom_boxplot(outlier.alpha = 0.05, outlier.size = 0.5, width = 0.6) +
   facet_wrap(~ variable, scales = "free_x") +
   coord_cartesian(ylim = c(0, 180)) +
-  theme_minimal() +
-  theme(legend.position = "none") +
-  labs(title = "Arrival Delay by Categorical Variables (Zoomed to 0–180 min)",
-       y = "Arrival Delay (minutes)", x = "")
+  labs(title = "Arrival Delay by Categorical Variables",
+       subtitle = "Zoomed to 0\u2013180 minutes; medians and IQRs are nearly identical across all groups",
+       y = "Arrival Delay (minutes)", x = NULL) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_report() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 15, hjust = 1))
 ```
-
 
 ### Imputation Justification Summary
 
 Combining the numerical and categorical evidence:
 
-1. **Departure delay** is the only variable with a meaningful relationship with arrival delay (Pearson r ≈ 0.97).
-2. All other **numeric variables** have near-zero correlations (|r| < 0.05).
-3. **Categorical variables** show no practically meaningful differences in arrival delay across their levels.
+1.  **Departure delay** is the only variable with a meaningful relationship with arrival delay (Pearson r ≈ 0.97).
+2.  All other **numeric variables** have near-zero correlations (\|r\| \< 0.05).
+3.  **Categorical variables** show no practically meaningful differences in arrival delay across their levels.
 
 Therefore, a simple linear regression `arrival_delay ~ departure_delay` is the most appropriate and parsimonious imputation model. Adding further predictors would contribute negligible information while increasing model complexity unnecessarily.
 
@@ -448,19 +499,19 @@ delay_model <- lm(arrival_delay_in_minutes ~ departure_delay_in_minutes,
 summary(delay_model)
 ```
 
-The model summary reveals an extremely strong fit: the R² is approximately 0.94, meaning that departure delay alone explains 94% of the variance in arrival delay. The F-statistic is enormous and the p-value for the coefficient is effectively zero, confirming that the linear relationship is both highly significant and practically strong. The regression coefficient (~1.02) indicates that each additional minute of departure delay translates into approximately one additional minute of arrival delay on average — an intuitive and operationally sensible result.
+The model summary reveals an extremely strong fit: the R² is approximately 0.93, meaning that departure delay alone explains 93% of the variance in arrival delay. The F-statistic is enormous and the p-value for the coefficient is effectively zero, confirming that the linear relationship is both highly significant and practically strong. The regression coefficient (\~1.02) indicates that each additional minute of departure delay translates into approximately one additional minute of arrival delay on average — an intuitive and operationally sensible result.
 
-```{r imputation-scatter, fig.height=4}
+```{r imputation-scatter, fig.height=5, fig.width=7}
 ggplot(train_reg, aes(x = departure_delay_in_minutes, y = arrival_delay_in_minutes)) +
-  geom_point(alpha = 0.2, color = "steelblue", size = 0.5) +
-  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  geom_point(alpha = 0.15, color = "#3498DB", size = 0.4) +
+  geom_smooth(method = "lm", color = "#E74C3C", se = TRUE, linewidth = 1.2) +
   coord_cartesian(xlim = c(0, 200), ylim = c(0, 200)) +
-  labs(title = "Arrival Delay vs Departure Delay with Fitted Regression Line",
-       subtitle = paste("Pearson r =",
-                        round(cor(train_reg$departure_delay_in_minutes,
-                                  train_reg$arrival_delay_in_minutes), 4)),
-       x = "Departure Delay (min)", y = "Arrival Delay (min)") +
-  theme_minimal()
+  labs(title = "Imputation Model: Arrival Delay vs. Departure Delay",
+       subtitle = paste0("Fitted OLS line ; Pearson r = ",
+                         round(cor(train_reg$departure_delay_in_minutes,
+                                   train_reg$arrival_delay_in_minutes), 4)),
+       x = "Departure Delay (minutes)", y = "Arrival Delay (minutes)") +
+  theme_report()
 ```
 
 ## Cross-Validation of Imputation Accuracy
@@ -511,13 +562,13 @@ train$satisfaction <- factor(train$satisfaction)
 
 Before fitting any classification model we scale the predictor variables. This serves two purposes:
 
-1. **Coefficient comparability** — with all numeric predictors on similar scales, the magnitude of each logistic regression coefficient directly reflects its contribution to the log-odds of satisfaction, making it easy to rank and compare predictors regardless of their original measurement units.
-2. **Numerical stability** — the IRLS solver in `glm()` converges more reliably when variables do not span vastly different ranges (e.g., `flight_distance` in the thousands versus service ratings on a 0–5 scale).
+1.  **Coefficient comparability** — with all numeric predictors on similar scales, the magnitude of each logistic regression coefficient directly reflects its contribution to the log-odds of satisfaction, making it easy to rank and compare predictors regardless of their original measurement units.
+2.  **Numerical stability** — the IRLS solver in `glm()` converges more reliably when variables do not span vastly different ranges (e.g., `flight_distance` in the thousands versus service ratings on a 0–5 scale).
 
 We apply two scaling strategies that respect the nature of each variable group:
 
-- **Standard scaling (z-score)** for the four *continuous* variables (`age`, `flight_distance`, `departure_delay_in_minutes`, `arrival_delay_in_minutes`). Each variable is centred at its training-set mean and divided by its training-set standard deviation. A one-unit change in a standardised coefficient corresponds to a one-SD shift in the original variable — a natural unit for comparing variables with different spreads.
-- **Min-Max scaling** for the 14 *ordinal rating* variables (discrete 0–5 scale). Each rating is rescaled to $[0,\,1]$ via $(x - \min) / (\max - \min)$. This preserves the equal spacing between adjacent integer levels while placing all ratings on a common range. A coefficient of, say, 2.0 for a min-max scaled rating means that moving from the worst possible rating (0) to the best (5) changes the log-odds of satisfaction by 2.0.
+-   **Standard scaling (z-score)** for the four *continuous* variables (`age`, `flight_distance`, `departure_delay_in_minutes`, `arrival_delay_in_minutes`). Each variable is centred at its training-set mean and divided by its training-set standard deviation. A one-unit change in a standardised coefficient corresponds to a one-SD shift in the original variable — a natural unit for comparing variables with different spreads.
+-   **Min-Max scaling** for the 14 *ordinal rating* variables (discrete 0–5 scale). Each rating is rescaled to $[0,\,1]$ via $(x - \min) / (\max - \min)$. This preserves the equal spacing between adjacent integer levels while placing all ratings on a common range. A coefficient of, say, 2.0 for a min-max scaled rating means that moving from the worst possible rating (0) to the best (5) changes the log-odds of satisfaction by 2.0.
 
 All scaling parameters — means, standard deviations, minima, and maxima — are **computed from the training set only**. The test set is not scaled here; it will be preprocessed within the model evaluation pipeline.
 
@@ -566,7 +617,7 @@ apply(train_scaled[, rating_vars], 2, range) %>%
 
 ## Logistic Regression on Full Training Set
 
-Following the approach from the course lab (Ch. 4), we fit a logistic regression using `glm()` with `family = binomial` on all available predictors. We fit on the **entire training set** to get the most reliable coefficient estimates and p-values for interpretation.
+We begin our classification analysis with logistic regression — the natural starting point for a binary response. We fit the model using `glm()` with `family = binomial` on all available predictors. The model estimates the conditional probability $P(Y = \text{satisfied} \mid X)$ via the logistic function, and the coefficients describe how each predictor shifts the log-odds of satisfaction. We fit on the **entire training set** to obtain the most stable coefficient estimates and $p$-values for interpretation.
 
 ### Model Fitting
 
@@ -602,24 +653,22 @@ Because predictors are now scaled, coefficients are directly comparable in magni
 
 Key observations from the coefficient table:
 
-- `Customer_type` is likely the most influential predictor: being a Loyal Customer increases the odds of satisfaction by a factor of 8.54, keeping all other variables constant.
--`Type_of_travel` has a strong negative effect: passengers traveling for Personal Travel have substantially lower odds of satisfaction (OR = 0.067) compared to business travelers.
--`Class` also plays a significant role: compared to the reference category (Business class), passengers in Economy (OR = 0.45) and Economy Plus (OR = 0.37) are significantly less likely to be satisfied.
+-   `Customer_type` is likely the most influential predictor: being a Loyal Customer increases the odds of satisfaction by a factor of 8.54, keeping all other variables constant. -`Type_of_travel` has a strong negative effect: passengers traveling for Personal Travel have substantially lower odds of satisfaction (OR = 0.067) compared to business travelers. -`Class` also plays a significant role: compared to the reference category (Business class), passengers in Economy (OR = 0.45) and Economy Plus (OR = 0.37) are significantly less likely to be satisfied.
 
-- The **Null deviance** vs **Residual deviance** comparison in the summary output shows a substantial reduction, confirming that the predictors collectively explain a meaningful portion of the variation in satisfaction.
-- Some variables (e.g., `gate_location`, `gender`) have p-values well above 0.05, suggesting they contribute little after accounting for the other predictors. These are candidates for removal via feature selection.
+-   The **Null deviance** vs **Residual deviance** comparison in the summary output shows a substantial reduction, confirming that the predictors collectively explain a meaningful portion of the variation in satisfaction.
 
+-   Most predictors are statistically significant at the 5% level. The main exception is flight_distance (p = 0.1287), which does not appear to contribute meaningfully after controlling for the other variables. \## Feature Selection: Forward Stepwise via `step()`
 
-## Feature Selection: Forward Stepwise via `step()`
+The full model includes all 23 predictors, but the coefficient table reveals that several have large $p$-values, suggesting they add little discriminative power after accounting for the remaining variables. As discussed in ISLR (Section 6.1), selecting a parsimonious subset of predictors can reduce variance without substantially increasing bias, particularly when some features are nearly redundant. Since the dataset has 23 dummy-encoded predictors (exceeding the 15-variable limit of `bestglm`) and \$\sim\$100k observations, we use R's `step()` function with forward selection to identify the best model under both AIC and BIC.
 
-The full model includes all predictors, but some contribute little after controlling for the others. Since the dataset has 23 dummy-encoded predictors (exceeding the 15-variable limit of `bestglm`) and ~100k observations, we use R's `step()` function with forward selection to identify the best model under both AIC and BIC.
+The full model includes all 23 predictors. Although most coefficients are statistically significant, using all variables may still introduce problems related to model complexity, redundancy, and multicollinearity. In particular, several service-rating variables measure closely related aspects of the passenger experience, so they may contain overlapping information that is not fully obvious from the correlation matrix alone. To obtain a more parsimonious model, we therefore apply forward stepwise feature selection using step(), and compare models selected under both AIC and BIC. Selecting a parsimonious subset of predictors can reduce variance without substantially increasing bias.
 
 **How `step()` works:** Starting from the null (intercept-only) model, forward selection evaluates every possible single-variable addition at each iteration and picks the one that most improves the information criterion. The process stops when no addition improves the criterion.
 
 **Information criteria recap:**
 
-- **AIC** = $-2\ell + 2k$: moderate penalty per parameter; tends to retain more variables.
-- **BIC** = $-2\ell + k\log n$: stronger penalty (for our training size of ~100k, $\log n \approx 11.5$); favours more parsimonious models.
+-   **AIC** = $-2\ell + 2k$: moderate penalty per parameter; tends to retain more variables.
+-   **BIC** = $-2\ell + k\log n$: stronger penalty (for our training size of \~100k, $\log n \approx 11.5$); favours more parsimonious models.
 
 ### Forward Selection with AIC
 
@@ -628,7 +677,7 @@ full_mod <- glm(satisfaction ~ ., data = train_scaled, family = binomial)
 null_mod <- glm(satisfaction ~ 1, data = train_scaled, family = binomial)
 
 # Forward selection using AIC (default k = 2)
-step_fwd_aic <- step(null_mod,
+step_fwd_aic <- stats::step(null_mod,
                      scope = list(lower = null_mod, upper = full_mod),
                      direction = "forward",
                      trace = 0)
@@ -644,11 +693,11 @@ summary(step_fwd_aic)
 
 ```{r step-forward-bic, cache=TRUE}
 # Forward selection using BIC (k = log(n))
-step_fwd_bic <- step(null_mod,
+step_fwd_bic <- stats::step(null_mod,
                      scope = list(lower = null_mod, upper = full_mod),
                      direction = "forward",
                      k = log(nrow(train_scaled)),
-                     trace = 0)
+                     trace = 1)
 
 cat("=== Forward Selection — BIC ===\n")
 cat("Predictors selected:", length(coef(step_fwd_bic)) - 1, "\n")
@@ -656,6 +705,20 @@ cat("AIC:", round(AIC(step_fwd_bic), 2), "\n")
 cat("BIC:", round(BIC(step_fwd_bic), 2), "\n\n")
 summary(step_fwd_bic)
 ```
+
+```{r}
+# Likelihood Ratio Test: BIC-reduced vs Full logistic regression
+anova(step_fwd_bic, glm_full, test = "Chisq")
+# Side-by-side comparison
+data.frame(
+  Model       = c("BIC Reduced (19 predictors)", "Full (23 predictors)"),
+  Df          = c(df.residual(step_fwd_bic), df.residual(glm_full)),
+  Deviance    = c(deviance(step_fwd_bic),    deviance(glm_full)),
+  AIC         = c(AIC(step_fwd_bic),         AIC(glm_full)),
+  BIC         = c(BIC(step_fwd_bic),         BIC(glm_full))
+)
+```
+
 The BIC-selected model retains 19 predictors, dropping `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. Comparing with the full model, the coefficient estimates for the retained variables change only marginally, confirming that the dropped variables were neither confounders nor suppressors. The key coefficients in the reduced model remain consistent with our earlier interpretation: `customer_typeLoyal Customer` carries a large positive effect (high odds of satisfaction), `type_of_travelPersonal Travel` a large negative effect, and the service ratings `online_boarding`, `inflight_entertainment`, and `seat_comfort` retain their strong positive associations with satisfaction. The BIC model achieves comparable deviance to the AIC model with four fewer parameters, confirming it as the more parsimonious choice without sacrificing explanatory power.
 
 ### Comparison of Selected Models
@@ -679,14 +742,11 @@ if (length(dropped) > 0) {
 }
 ```
 
-The AIC forward selection retained all 23 predictors — the penalty was not strong enough to exclude any variable given the large sample size. The BIC model, with its heavier penalty ($\log n \approx 11.5$ vs 2 for AIC), dropped four predictors: `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. These are precisely the variables that showed high p-values in the full logistic regression, confirming that they contribute negligible discriminative power after accounting for the other predictors. We adopt the **BIC-selected 19-predictor model** as our reduced model going forward, as it achieves nearly the same fit with fewer parameters.
-
-
-
+The AIC forward selection retained all 23 predictors — the penalty was not strong enough to exclude any variable given the large sample size. The BIC model, with its heavier penalty ($\log n \approx 11.5$ vs 2 for AIC), dropped four predictors: `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance`. These are variables contribute negligible discriminative power after accounting for the other predictors. We adopt the **BIC-selected 19-predictor model** as our reduced model going forward, as it achieves nearly the same fit with fewer parameters.
 
 ## Linear Discriminant Analysis (LDA)
 
-LDA finds a linear combination of predictors that maximises the ratio of between-class variance to within-class variance — i.e., Fisher's criterion. For a binary problem ($K = 2$), this produces a single discriminant axis, LD1. LDA assumes that both classes share a common covariance matrix $\Sigma$, so the log-ratio of the class-conditional densities simplifies to a linear function of the predictors, yielding a linear decision boundary.
+As an alternative to logistic regression, we now consider LDA (ISLR, Section 4.4). While logistic regression models the posterior probability $P(Y = k \mid X)$ directly, LDA takes a generative approach: it models the class-conditional density $f_k(x) = P(X \mid Y = k)$ for each class $k$ and then applies Bayes' theorem to obtain the posterior. Under the assumption that both classes share a common covariance matrix $\Sigma$ and that the class-conditional densities are multivariate Gaussian, the log-ratio of posteriors simplifies to a linear function of the predictors, yielding a linear decision boundary — hence the name. For a binary problem ($K = 2$), LDA produces a single discriminant axis (LD1) that maximises Fisher's criterion: the ratio of between-class variance to within-class variance.
 
 Formally, LDA classifies an observation $\mathbf{x}$ to the class $k$ that maximises the discriminant score:
 
@@ -720,22 +780,25 @@ lda_coefs %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-```{r lda-coef-barplot, fig.height=7}
-# Visual: horizontal bar plot of LD1 coefficients
+```{r lda-coef-barplot, fig.height=8, fig.width=9}
 lda_coefs %>%
-  mutate(Variable = factor(Variable, levels = rev(Variable))) %>%
-  ggplot(aes(x = LD1, y = Variable, fill = LD1 > 0)) +
-  geom_col(alpha = 0.8, show.legend = FALSE) +
-  scale_fill_manual(values = c("TRUE" = "#3498DB", "FALSE" = "#E74C3C")) +
-  geom_vline(xintercept = 0, linewidth = 0.5) +
-  labs(title = "LDA Scaling Coefficients (LD1)",
-       subtitle = "Blue = positive (pushes toward satisfied), Red = negative (pushes toward dissatisfied)",
+  mutate(Variable = factor(Variable, levels = rev(Variable)),
+         Direction = ifelse(LD1 > 0, "Positive (toward satisfied)",
+                                      "Negative (toward dissatisfied)")) %>%
+  ggplot(aes(x = LD1, y = Variable, fill = Direction)) +
+  geom_col(alpha = 0.85, show.legend = TRUE) +
+  scale_fill_manual(values = c("Positive (toward satisfied)" = "#3498DB",
+                                "Negative (toward dissatisfied)" = "#E74C3C"),
+                    name = "Direction on LD1") +
+  geom_vline(xintercept = 0, linewidth = 0.6, color = "grey30") +
+  labs(title = "LDA Discriminant Coefficients (LD1 Scaling Vector)",
+       subtitle = "Magnitude reflects each predictor's contribution to the optimal separating direction",
        x = "LD1 Coefficient", y = NULL) +
-  theme_minimal(base_size = 11) +
-  theme(plot.subtitle = element_text(color = "grey40"))
+  theme_report(base_size = 12) +
+  theme(legend.position = "top")
 ```
 
-**Interpretation of the scaling vector.**  The LD1 scaling vector defines the linear combination of predictors that forms the discriminant axis — the direction in feature space that best separates the two classes. The three strongest drivers of satisfaction are online_boarding (1.613), inflight_wifi_service (1.365), and customer_type: Loyal Customer (1.252), while type_of_travel: Personal Travel (-1.544) and ease_of_online_booking (-0.819) are the strongest drivers of dissatisfaction. Predictors such as genderMale (0.029) and flight_distance (0.005) contribute negligibly to the discriminant axis.
+**Interpretation of the scaling vector.** The LD1 scaling vector defines the linear combination of predictors that forms the discriminant axis — the direction in feature space that best separates the two classes. The three strongest drivers of satisfaction are online_boarding (1.613), inflight_wifi_service (1.365), and customer_type: Loyal Customer (1.252), while type_of_travel: Personal Travel (-1.544) and ease_of_online_booking (-0.819) are the strongest drivers of dissatisfaction. Predictors such as genderMale (0.029) and flight_distance (0.005) contribute negligibly to the discriminant axis.
 
 **Connection with BIC feature selection.** Reassuringly, the variables dropped by BIC in the logistic regression step — `gate_location`, `food_and_drink`, `genderMale`, and `flight_distance` — are precisely those that receive the smallest LD1 coefficients in absolute value. For instance, `genderMale` (0.029) and `flight_distance` (0.005) are the two weakest contributors to the discriminant axis, while `gate_location` and `food_and_drink` also rank near the bottom. This convergence across two independent methods (penalised likelihood selection and Fisher's discriminant) strengthens our confidence that these variables are genuinely uninformative for predicting satisfaction once the remaining predictors are accounted for.
 
@@ -760,29 +823,23 @@ ld1_df <- data.frame(
 ggplot(ld1_df, aes(x = LD1, fill = Class)) +
   geom_histogram(aes(y = after_stat(density)), bins = 80,
                  alpha = 0.4, position = "identity", color = "white", linewidth = 0.1) +
-  geom_density(aes(color = Class), linewidth = 1, fill = NA) +
-#  geom_vline(xintercept = lda_threshold, linetype = "dashed", color = "grey30", linewidth = 0.7) +
-#  annotate("text", x = lda_threshold, y = Inf, label = "Decision\nThreshold",
-#           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
-  scale_fill_manual(values = c("neutral or dissatisfied" = "#E74C3C",
-                                "satisfied" = "#3498DB")) +
+  geom_density(aes(color = Class), linewidth = 1.1, fill = NA) +
+  scale_fill_manual(values = palette_sat) +
   scale_color_manual(values = c("neutral or dissatisfied" = "#C0392B",
                                  "satisfied" = "#2980B9")) +
-  labs(title = "LDA: Distribution of LD1 Scores by Class",
-       subtitle = "Histogram with KDE overlay ",
+  labs(title = "Distribution of LD1 Discriminant Scores by Class",
+       subtitle = "Histogram with kernel density overlay; overlap near zero indicates the region of highest classification uncertainty",
        x = "LD1 Score", y = "Density",
        fill = "Class", color = "Class") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        plot.subtitle = element_text(color = "grey40"))
+  theme_report() +
+  theme(legend.position = "bottom")
 ```
 
-The two classes are well separated along LD1, with satisfied passengers concentrating around positive scores and dissatisfied passengers around negative scores. The overlap region near zero represents observations where the two classes are hardest to distinguish, and corresponds to the highest classification uncertainty under the model. The skewness visible in the satisfied class suggests the normality assumption may be imperfect, which motivates also fitting QDA as a comparison.
-
+The two classes are well separated along LD1, with satisfied passengers concentrating around positive scores and dissatisfied passengers around negative scores. The overlap region near zero represents observations where the two classes are hardest to distinguish, and corresponds to the highest classification uncertainty under the model. The skewness visible in the satisfied class suggests the normality assumption may be imperfect.
 
 ## Naive Bayes on Full Training Data
 
-Before proceeding to dimensionality reduction, we fit a Naive Bayes classifier with default hyperparameters on the full training set. The purpose is not model selection but exploratory interpretation: Naive Bayes estimates class-conditional distributions for each predictor independently, and the resulting summary gives us a concise snapshot of how each feature's mean and spread differ between satisfied and dissatisfied passengers.
+Before proceeding to dimensionality reduction, we fit a Naive Bayes classifier on the full training set. The defining assumption of Naive Bayes is conditional independence: within each class, the predictors are assumed to be independent of one another. This is clearly violated in our data (e.g., departure and arrival delay are almost perfectly correlated, and service ratings exhibit moderate positive inter-correlations). Despite this, Naive Bayes often performs reasonably well in practice because the posterior probabilities only need to rank observations correctly, not be perfectly calibrated. We fit it here primarily for exploratory interpretation: the class-conditional means and standard deviations provide a concise snapshot of how each feature's distribution differs between satisfied and dissatisfied passengers.
 
 ```{r naive-bayes-full-exploration}
 library(e1071)
@@ -791,29 +848,42 @@ nb_explore <- naiveBayes(satisfaction ~ ., data = train_scaled)
 nb_explore
 ```
 
-**Interpretation of the Naive Bayes summary.**  The output shows the class-conditional means and standard deviations for each numeric predictor, as well as the conditional class probabilities for each level of the categorical predictors. Key observations:
+**Interpretation of the Naive Bayes summary.** The output shows the class-conditional means and standard deviations for each numeric predictor, as well as the conditional class probabilities for each level of the categorical predictors. Key observations:
 
-- The **a-priori probabilities** reflect the class balance we observed earlier (~56.7% dissatisfied, ~43.3% satisfied).
-- Among the continuous variables, `online_boarding` and `inflight_entertainment` show the largest separation in class-conditional means — satisfied passengers rate these much higher on average — which aligns with the LDA and logistic regression findings.
-- Variables like `departure_delay_in_minutes` and `arrival_delay_in_minutes` have very similar means across both classes, confirming that delays contribute little to the satisfaction prediction.
-- For categorical predictors, `type_of_travel` and `customer_type` show large differences in conditional probabilities between classes, again consistent with the strong effects identified by logistic regression and LDA.
+-   The **a-priori probabilities** reflect the class balance we observed earlier (\~56.7% dissatisfied, \~43.3% satisfied).
+-   Among the continuous variables, `online_boarding` and `inflight_entertainment` show the largest separation in class-conditional means — satisfied passengers rate these much higher on average — which aligns with the LDA and logistic regression findings.
+-   Variables like `departure_delay_in_minutes` and `arrival_delay_in_minutes` have very similar means across both classes, confirming that delays contribute little to the satisfaction prediction.
+-   For categorical predictors, `type_of_travel` and `customer_type` show large differences in conditional probabilities between classes, again consistent with the strong effects identified by logistic regression and LDA.
 
 The Naive Bayes assumption of conditional independence between predictors is clearly violated (e.g., departure and arrival delay are almost perfectly correlated), so we do not expect Naive Bayes to be the top-performing classifier. However, its simplicity and interpretability make it a useful baseline for comparison.
 
-
 ## Principal Component Analysis (PCA)
 
-Before fitting PCA-based classifiers, we apply PCA to the numeric predictor matrix to reduce dimensionality. PCA finds orthogonal directions of maximum variance in the data, which can help mitigate multicollinearity and reduce the number of parameters that need to be estimated — particularly relevant for QDA, which estimates a full covariance matrix per class.
+Following the dimensionality reduction approach described in ISLR (Section 6.3), we apply PCA to the numeric predictor matrix before fitting PCA-based classifiers. PCA identifies orthogonal directions (principal components) of maximum variance in the data, effectively rotating the coordinate system so that the first few components capture most of the variability. This can help mitigate multicollinearity among correlated predictors and reduce the number of parameters that need to be estimated.
 
-We apply PCA to the **model matrix** (with dummy-encoded categoricals) to ensure all predictors are numeric.
+Before constructing the predictor matrix for PCA, we apply a $\log(1 + x)$ transformation to `departure_delay_in_minutes` and `arrival_delay_in_minutes`. As observed in the EDA, both variables are heavily right-skewed with a large mass of near-zero values and a long upper tail reaching over 1,500 minutes. Without correction, these extreme values can dominate the first principal components — causing them to capture delay variability rather than the structure genuinely relevant to passenger satisfaction. The $\log(1 + x)$ transformation (using `log1p()`) compresses the upper tail, reduces the influence of extreme outliers, and treats zero delays correctly since $\log(1 + 0) = 0$. The remaining predictors are left untransformed. Centering and scaling are handled internally by `prcomp()` via `center = TRUE, scale. = TRUE`.
+
+We apply PCA to the **model matrix** (with dummy-encoded categoricals) to ensure all predictors are numeric. We apply PCA to the **model matrix** (with dummy-encoded categoricals) to ensure all predictors are numeric.
 
 ```{r pca-fit}
-# Build numeric model matrix (same as used for step selection)
+# Log1p-transform the two delay variables before PCA
+# Applied to the imputed unscaled training data so that log1p acts on
+# the original positive values (z-scored delays can be negative, so
+# log1p must come before standardisation)
+train_for_pca <- train %>%
+  mutate(
+    departure_delay_in_minutes = log1p(departure_delay_in_minutes),
+    arrival_delay_in_minutes   = log1p(arrival_delay_in_minutes)
+  )
+
+# Build numeric model matrix (dummy-encode categoricals)
 train_mm_pca <- as.data.frame(
-  model.matrix(satisfaction ~ ., data = train_scaled)[, -1]
+  model.matrix(satisfaction ~ ., data = train_for_pca)[, -1]
 )
 
-# PCA on the predictor matrix (already scaled)
+# PCA on the predictor matrix
+# center = TRUE and scale. = TRUE standardise all columns internally,
+# so no prior manual scaling is needed here
 pca_fit <- prcomp(train_mm_pca, center = TRUE, scale. = TRUE)
 
 # Variance explained
@@ -838,37 +908,193 @@ n_pc_90 <- min(which(cum_var >= 0.90))
 cat("PCs needed for 90% variance:", n_pc_90, "\n")
 
 p1 <- ggplot(pca_df, aes(x = PC, y = Variance)) +
-  geom_col(fill = "steelblue", alpha = 0.7) +
-  geom_line(color = "darkblue", linewidth = 0.8) +
-  geom_point(color = "darkblue", size = 2) +
-  labs(title = "Scree Plot", x = "Principal Component", y = "Proportion of Variance") +
+  geom_col(fill = "#3498DB", alpha = 0.7, width = 0.7) +
+  geom_line(color = "#2C3E50", linewidth = 0.8) +
+  geom_point(color = "#2C3E50", size = 2) +
+  labs(title = "Scree Plot",
+       x = "Principal Component", y = "Proportion of Variance") +
   scale_x_continuous(breaks = 1:length(var_explained)) +
-  theme_minimal()
+  theme_report(base_size = 11)
 
 p2 <- ggplot(pca_df, aes(x = PC, y = Cumulative)) +
-  geom_line(color = "tomato", linewidth = 0.8) +
-  geom_point(color = "tomato", size = 2) +
+  geom_line(color = "#E74C3C", linewidth = 0.9) +
+  geom_point(color = "#E74C3C", size = 2) +
   geom_hline(yintercept = 0.90, linetype = "dashed", color = "grey40") +
   geom_vline(xintercept = n_pc_90, linetype = "dashed", color = "grey40") +
   annotate("text", x = n_pc_90 + 0.5, y = 0.85,
-           label = paste0(n_pc_90, " PCs = 90%"), hjust = 0, size = 3.5) +
+           label = paste0(n_pc_90, " PCs = 90%"), hjust = 0, size = 3.5,
+           fontface = "bold", color = "grey30") +
   labs(title = "Cumulative Variance Explained",
        x = "Principal Component", y = "Cumulative Proportion") +
   scale_x_continuous(breaks = 1:length(var_explained)) +
-  theme_minimal()
+  theme_report(base_size = 11)
 
 grid.arrange(p1, p2, ncol = 2)
 ```
 
-The scree plot shows how much variance each principal component captures. The cumulative plot identifies how many components are needed to reach the 90% threshold. We retain the first `r n_pc_90` principal components for the PCA-based classifiers.
+The scree plot shows how much variance each principal component captures. The cumulative plot identifies how many components are needed to reach the 90% threshold. These plots provide context, but the actual number of components used in all subsequent PCA-based classifiers is determined by cross-validation AUC (see below), not the 90% threshold.
 
-Note: We do not produce PCA-based decision boundary plots for LDA and QDA. Projecting the data onto just two principal components and then fitting a 2D classifier discards the information from all other components, which makes the resulting boundaries misleading. The LD1 histogram above already provides a more faithful representation of how LDA separates the classes using the full predictor space. For QDA, which does not produce a single discriminant axis, we focus instead on comparing group means and on predictive performance metrics in the evaluation section below.
+### PCR: Cross-Validation for Optimal Number of Components
+
+Principal Components Regression (PCR) selects the number of components $M$ by cross-validation rather than by a fixed variance threshold. Following the ISLR v2 PCR approach (Section 6.3.1), we evaluate $M = 1, 2, \ldots, M_{\max}$ components using 10-fold cross-validation on the full training set. Instead of minimising MSE (as in the continuous response setting), we **maximise the cross-validation AUC**, since our outcome is binary.
+
+**Pipeline approach:** In each fold, all preprocessing (imputation, log-transform, z-score and min-max scaling, dummy encoding) is fitted exclusively on the training portion of that fold and applied to the held-out portion. PCA is then computed on the scaled training matrix, and the learned rotation is applied to the held-out matrix — strictly no information from the held-out fold leaks into the transformation.
+
+```{r pcr-cv, cache=TRUE}
+# Max PCs to evaluate: n_pc_90 + 5 (or 30 max for computational speed)
+max_pcs_try <- 23
+pc_seq      <- seq_len(max_pcs_try)
+
+set.seed(42)
+n_folds_pcr  <- 10
+pcr_fold_ids <- createFolds(train_with_na$satisfaction, k = n_folds_pcr, returnTrain = FALSE)
+
+pcr_auc_mat <- matrix(NA_real_, nrow = max_pcs_try, ncol = n_folds_pcr)
+
+cont_vars_pcr   <- c("age", "flight_distance",
+                     "departure_delay_in_minutes", "arrival_delay_in_minutes")
+rating_vars_pcr <- c("inflight_wifi_service", "departure_arrival_time_convenient",
+                     "ease_of_online_booking", "gate_location", "food_and_drink",
+                     "online_boarding", "seat_comfort", "inflight_entertainment",
+                     "on_board_service", "leg_room_service", "baggage_handling",
+                     "checkin_service", "inflight_service", "cleanliness")
+
+for (f in seq_len(n_folds_pcr)) {
+  cat(sprintf("\rPCR CV: fold %d / %d   ", f, n_folds_pcr))
+
+  idx_val <- pcr_fold_ids[[f]]
+  tr_raw  <- train_with_na[-idx_val, ]
+  va_raw  <- train_with_na[idx_val, ]
+
+  # 1. Impute arrival delay (fit model on training fold only)
+  tr_comp <- tr_raw %>% filter(!is.na(arrival_delay_in_minutes))
+  delay_m <- lm(arrival_delay_in_minutes ~ departure_delay_in_minutes, data = tr_comp)
+  tr_raw$arrival_delay_in_minutes[is.na(tr_raw$arrival_delay_in_minutes)] <-
+    predict(delay_m, newdata = tr_raw[is.na(tr_raw$arrival_delay_in_minutes), ])
+  va_raw$arrival_delay_in_minutes[is.na(va_raw$arrival_delay_in_minutes)] <-
+    predict(delay_m, newdata = va_raw[is.na(va_raw$arrival_delay_in_minutes), ])
+
+  # 1b. Log1p-transform delay variables (consistent with pca-fit chunk above)
+  tr_raw$departure_delay_in_minutes <- log1p(tr_raw$departure_delay_in_minutes)
+  tr_raw$arrival_delay_in_minutes   <- log1p(tr_raw$arrival_delay_in_minutes)
+  va_raw$departure_delay_in_minutes <- log1p(va_raw$departure_delay_in_minutes)
+  va_raw$arrival_delay_in_minutes   <- log1p(va_raw$arrival_delay_in_minutes)
+
+  # 2. Factor-encode response
+  tr_y <- factor(tr_raw$satisfaction)
+  va_y <- factor(va_raw$satisfaction)
+
+  # 3. Build numeric model matrices (dummy-encode categoricals)
+  tr_mm <- model.matrix(~ . - satisfaction,
+                        data = tr_raw %>% mutate(satisfaction = factor(satisfaction)))[, -1]
+  va_mm <- tryCatch(
+    model.matrix(~ . - satisfaction,
+                 data = va_raw %>% mutate(satisfaction = factor(satisfaction)))[, -1],
+    error = function(e) NULL
+  )
+  if (is.null(va_mm)) next
+
+  # Align columns (handle rare dummy levels absent from one fold)
+  common_cols <- intersect(colnames(tr_mm), colnames(va_mm))
+  tr_mm <- tr_mm[, common_cols, drop = FALSE]
+  va_mm <- va_mm[, common_cols, drop = FALSE]
+
+  # 4. Scale using training fold parameters (z-score for all columns)
+  col_means <- colMeans(tr_mm)
+  col_sds   <- apply(tr_mm, 2, sd)
+  col_sds[col_sds == 0] <- 1
+  tr_mm_s <- scale(tr_mm, center = col_means, scale = col_sds)
+  va_mm_s <- scale(va_mm, center = col_means, scale = col_sds)
+
+  # 5. PCA on training fold (data already centred/scaled → centre = FALSE)
+  pca_f  <- prcomp(tr_mm_s, center = FALSE, scale. = FALSE)
+  tr_pcs <- predict(pca_f, tr_mm_s)
+  va_pcs <- predict(pca_f, va_mm_s)
+
+  # 6. For each M, fit logistic regression on first M PCs and record AUC
+  for (M in pc_seq) {
+    if (M > ncol(tr_pcs)) break
+    tr_df <- as.data.frame(tr_pcs[, 1:M, drop = FALSE])
+    tr_df$satisfaction <- tr_y
+    va_df <- as.data.frame(va_pcs[, 1:M, drop = FALSE])
+
+    fit <- tryCatch(
+      glm(satisfaction ~ ., data = tr_df, family = binomial),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+
+    probs <- predict(fit, va_df, type = "response")
+    pcr_auc_mat[M, f] <- as.numeric(auc(
+      roc(va_y, probs,
+          levels = c("neutral or dissatisfied", "satisfied"),
+          direction = "<", quiet = TRUE)
+    ))
+  }
+}
+cat("\nPCR cross-validation complete.\n")
+```
+
+```{r pcr-cv-results}
+pcr_cv_df <- data.frame(
+  M        = pc_seq,
+  Mean_AUC = rowMeans(pcr_auc_mat, na.rm = TRUE),
+  SD_AUC   = apply(pcr_auc_mat, 1, sd, na.rm = TRUE)
+)
+
+n_pc_max_auc <- pc_seq[which.max(pcr_cv_df$Mean_AUC)]
+
+cat(sprintf("M with highest CV AUC: %d (AUC = %.4f)\n",
+            n_pc_max_auc, max(pcr_cv_df$Mean_AUC, na.rm = TRUE)))
+cat(sprintf("Number of PCs for 90%% variance: %d\n", n_pc_90))
+
+# Use the CV-maximising M as the selected number of components
+n_pc_optimal <- n_pc_max_auc
+cat(sprintf("Selected M (CV-maximising): %d (AUC = %.4f)\n",
+            n_pc_optimal, pcr_cv_df$Mean_AUC[n_pc_optimal]))
+```
+
+```{r pcr-cv-plot, fig.height=5, fig.width=10}
+best_row <- pcr_cv_df[n_pc_optimal, ]
+
+ggplot(pcr_cv_df, aes(x = M, y = Mean_AUC)) +
+  geom_ribbon(aes(ymin = Mean_AUC - SD_AUC, ymax = Mean_AUC + SD_AUC),
+              alpha = 0.18, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(xintercept = n_pc_optimal, linetype = "dashed",
+             color = "tomato", linewidth = 0.8) +
+  geom_vline(xintercept = n_pc_90, linetype = "dotted",
+             color = "grey50", linewidth = 0.8) +
+  geom_point(data = best_row, aes(x = M, y = Mean_AUC),
+             color = "tomato", size = 4.5, shape = 21, stroke = 1.5, fill = "white") +
+  annotate("text", x = n_pc_optimal + 0.4,
+           y = best_row$Mean_AUC - 0.004,
+           label = sprintf("Selected M = %d\nAUC = %.4f",
+                           n_pc_optimal, best_row$Mean_AUC),
+           hjust = 0, size = 3.5, color = "#C0392B", fontface = "bold") +
+  annotate("text", x = n_pc_90 + 0.4,
+           y = min(pcr_cv_df$Mean_AUC, na.rm = TRUE) + 0.002,
+           label = paste0("90% var =\n", n_pc_90, " PCs"),
+           hjust = 0, size = 3, color = "grey50") +
+  labs(title = "PCR: 10-Fold Cross-Validated AUC vs. Number of Principal Components",
+       subtitle = paste0("Red circle = selected M = ", n_pc_optimal,
+                         " (highest CV AUC); dotted line = 90% variance threshold"),
+       x = "Number of Principal Components (M)",
+       y = "Mean 10-Fold CV AUC") +
+  theme_report() +
+  theme(legend.position = "none")
+```
+
+The CV AUC increases and reaches its maximum at $M = 22$, which we adopt as the optimal number of components. The difference in CV AUC between $M = 22$ and $M = 23$ is negligible (or effectively zero), indicating that nearly all predictive information is already captured. Since this is very close to the maximum possible number of components, the gain from dimensionality reduction is minimal, suggesting that PCA does not substantially improve predictive performance. Therefore, PCA-based models are expected to perform similarly to models using the full set of original predictors.
+
+Note: We do not produce PCA-based decision boundary plots for LDA and QDA. Projecting the data onto just two principal components and then fitting a 2D classifier discards the information from all other components, which makes the resulting boundaries misleading. The LD1 histogram above already provides a more faithful representation of how LDA separates the classes using the full predictor space. For QDA, which does not produce a single discriminant axis, we focus instead on predictive performance metrics in the evaluation section below.
 
 # Model Evaluation and Selection
 
-We now proceed to a systematic comparison of five classification methods — Logistic Regression, LDA, QDA, KNN, and Naive Bayes — each fitted with **default hyperparameters** (no tuning) across three predictor (data version) configurations: the **Full** model (all predictors), the **BIC-reduced** model (19 predictors from forward stepwise selection), and the **PCA-transformed** data (principal components explaining 90% of variance). This yields a complete 5 × 3 = 15 model–data version grid.
+Having explored the data and fitted individual models for interpretive purposes, we now turn to the central question of model selection. The test error is the relevant quantity for comparing models, and a proper evaluation requires that the test data play no role in the fitting process. We conduct a systematic comparison of five classification methods — Logistic Regression, LDA, QDA, KNN, and Naive Bayes — each fitted with **default hyperparameters** (no tuning) across three predictor configurations: the **Full** model (all predictors), the **BIC-reduced** model (19 predictors from forward stepwise selection), and the **PCA-transformed** data (using the 22 of principal components determined earlier). This yields a complete $5 \times 3 = 15$ model-data version grid.
 
-**Important methodological note on data leakage.** To avoid data leakage, we perform all preprocessing — imputation and scaling — within each evaluation step. All imputation models and scaling parameters are fitted exclusively on the training portion and applied to the validation/test portions. This ensures that no information from the evaluation data leaks into the preprocessing.
+To avoid data leakage, we perform all preprocessing within each evaluation step. All imputation models and scaling parameters are fitted exclusively on the training portion and applied to the validation/test portions. This ensures that no information from the evaluation data leaks into the preprocessing.
 
 ## Train–Validation–Test Split
 
@@ -917,6 +1143,13 @@ train_val$arrival_delay_in_minutes[is.na(train_val$arrival_delay_in_minutes)] <-
 cat("NAs remaining — fit:", sum(is.na(train_fit$arrival_delay_in_minutes)),
     " val:", sum(is.na(train_val$arrival_delay_in_minutes)), "\n")
 
+# --- 1b. Log1p-transform delay variables (consistent with PCR CV pipeline) ---
+# Applied after imputation (values are non-negative) and before z-score scaling
+train_fit$departure_delay_in_minutes <- log1p(train_fit$departure_delay_in_minutes)
+train_fit$arrival_delay_in_minutes   <- log1p(train_fit$arrival_delay_in_minutes)
+train_val$departure_delay_in_minutes <- log1p(train_val$departure_delay_in_minutes)
+train_val$arrival_delay_in_minutes   <- log1p(train_val$arrival_delay_in_minutes)
+
 # --- 2. Convert target to factor ---
 train_fit$satisfaction <- factor(train_fit$satisfaction)
 train_val$satisfaction <- factor(train_val$satisfaction)
@@ -936,9 +1169,9 @@ fit_cont_means <- colMeans(train_fit[, cont_vars])
 fit_cont_sds   <- apply(train_fit[, cont_vars], 2, sd)
 
 train_fit[, cont_vars] <- scale(train_fit[, cont_vars],
-                                 center = fit_cont_means, scale = fit_cont_sds)
+                                center = fit_cont_means, scale = fit_cont_sds)
 train_val[, cont_vars] <- scale(train_val[, cont_vars],
-                                 center = fit_cont_means, scale = fit_cont_sds)
+                                center = fit_cont_means, scale = fit_cont_sds)
 
 # Min-max scaling for rating vars
 fit_rating_mins   <- apply(train_fit[, rating_vars], 2, min)
@@ -949,7 +1182,7 @@ for (v in rating_vars) {
   train_val[[v]] <- (train_val[[v]] - fit_rating_mins[v]) / fit_rating_ranges[v]
 }
 
-cat("Preprocessing complete .\n")
+cat("Preprocessing complete.\n")
 ```
 
 ### Preparing the Three Predictor Sets
@@ -966,20 +1199,21 @@ train_fit_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_fit)[,
 train_val_mm <- as.data.frame(model.matrix(satisfaction ~ ., data = train_val)[, -1])
 
 pca_fit_only <- prcomp(train_fit_mm, center = TRUE, scale. = TRUE)
-cum_var_fit  <- cumsum(pca_fit_only$sdev^2 / sum(pca_fit_only$sdev^2))
-n_pc_90_fit  <- min(which(cum_var_fit >= 0.90))
 
-# Transform both sets using fitting-set PCA
-train_fit_pca <- as.data.frame(predict(pca_fit_only, train_fit_mm)[, 1:n_pc_90_fit])
-train_val_pca <- as.data.frame(predict(pca_fit_only, train_val_mm)[, 1:n_pc_90_fit])
+# Use the CV-optimal M determined by PCR cross-validation above
+
+train_fit_pca <- as.data.frame(predict(pca_fit_only, train_fit_mm)[, 1:n_pc_optimal])
+train_val_pca <- as.data.frame(predict(pca_fit_only, train_val_mm)[, 1:n_pc_optimal])
 train_fit_pca$satisfaction <- train_fit$satisfaction
 train_val_pca$satisfaction <- train_val$satisfaction
 
-cat("PCA components retained (90% variance on fitting set):", n_pc_90_fit, "\n")
+cat("PCA components retained (CV-optimal by AUC):", n_pc_optimal, "\n")
 ```
+
 ```{r}
 bic_formula
 ```
+
 ## Initial Model Comparison (Default Hyperparameters)
 
 All models are fitted with **default hyperparameters** (no tuning). We report confusion matrices and classification metrics on the held-out validation set.
@@ -1114,7 +1348,7 @@ metrics_df %>%
 
 ### Selecting the Best Model–Data Version Combinations
 
-We use **AUC (Area Under the ROC Curve)** as the primary metric for model selection. This choice is motivated by two considerations. First, the dataset exhibits a moderate class imbalance (~57% dissatisfied vs ~43% satisfied), which means that raw accuracy can be misleading — a model that simply predicts the majority class would achieve ~57% accuracy without learning anything useful. AUC, by contrast, evaluates the model's ability to discriminate between the two classes across *all possible classification thresholds*, making it robust to class imbalance. Second, AUC directly measures the probability that a randomly chosen satisfied passenger receives a higher predicted probability than a randomly chosen dissatisfied passenger — a threshold-free summary of overall separability that is particularly informative when the optimal decision threshold is not known in advance.
+We use **AUC (Area Under the ROC Curve)** as the primary metric for model selection. This choice is motivated by two considerations. First, the dataset exhibits a moderate class imbalance (\~57% dissatisfied vs \~43% satisfied), which means that raw accuracy can be misleading — a model that simply predicts the majority class would achieve \~57% accuracy without learning anything useful. AUC, by contrast, evaluates the model's ability to discriminate between the two classes across *all possible classification thresholds*, making it robust to class imbalance. Second, AUC directly measures the probability that a randomly chosen satisfied passenger receives a higher predicted probability than a randomly chosen dissatisfied passenger — a threshold-free summary of overall separability that is particularly informative when the optimal decision threshold is not known in advance.
 
 Rather than simply picking the top 4 individual configurations, we identify the **best 2 models** and the **best 2 data versions** and form their 4 combinations. This structured approach lets us disentangle the effect of the model choice from the effect of the predictor set, and ensures we carry forward configurations that are strong on both dimensions.
 
@@ -1177,16 +1411,20 @@ names(roc_selected) <- selected_names
 
 colors_sel <- c("#E74C3C", "#3498DB", "#2ECC71", "#9B59B6")
 
+par(mar = c(4.5, 4.5, 3, 1), family = "sans")
 plot(roc_selected[[1]], col = colors_sel[1], lwd = 2.5,
-     main = "ROC Curves — Selected Configurations", legacy.axes = TRUE)
+     main = "ROC Curves \u2014 Selected Model Configurations (Validation Set)",
+     legacy.axes = TRUE, cex.main = 1.1, font.main = 2,
+     xlab = "False Positive Rate (1 \u2212 Specificity)",
+     ylab = "True Positive Rate (Sensitivity)")
 for (i in 2:length(roc_selected)) {
   plot(roc_selected[[i]], col = colors_sel[i], lwd = 2.5,
        add = TRUE, legacy.axes = TRUE)
 }
 abline(a = 0, b = 1, lty = 2, col = "grey60")
 legend("bottomright",
-       paste0(selected_names, " (AUC = ", round(sapply(roc_selected, auc), 4), ")"),
-       col = colors_sel, lwd = 2.5, cex = 0.85)
+       paste0(selected_names, "  (AUC = ", round(sapply(roc_selected, auc), 4), ")"),
+       col = colors_sel, lwd = 2.5, cex = 0.8, bty = "n")
 ```
 
 ### Confusion Matrices for Selected Configurations
@@ -1202,13 +1440,14 @@ for (i in seq_along(selected_names)) {
   cm_df <- as.data.frame(cm)
 
   cm_plots[[i]] <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
-    geom_tile(color = "white", linewidth = 1.2) +
-    geom_text(aes(label = format(Freq, big.mark = ",")), size = 4.5, fontface = "bold") +
-    scale_fill_gradient(low = "white", high = "steelblue") +
-    labs(title = nm) +
-    theme_minimal(base_size = 11) +
+    geom_tile(color = "white", linewidth = 1.5) +
+    geom_text(aes(label = format(Freq, big.mark = ",")), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#F7F7F7", high = "#3498DB") +
+    labs(title = nm, x = "Actual Class", y = "Predicted Class") +
+    theme_report(base_size = 11) +
     theme(legend.position = "none",
-          axis.text.x = element_text(angle = 20, hjust = 1))
+          axis.text.x = element_text(angle = 20, hjust = 1),
+          plot.title = element_text(hjust = 0.5, size = 12))
 }
 
 grid.arrange(grobs = cm_plots, ncol = 2)
@@ -1228,11 +1467,11 @@ metrics_df %>%
 
 ## Cross-Validation on 90% Data (Selected Configurations)
 
-The single train–validation split above gave us an initial ranking, but a single split can be sensitive to which observations end up in the validation set — we may have simply "got lucky" with a favourable partition. To obtain a more reliable estimate of test error and to verify that our models generalise consistently, we perform **10-fold cross-validation** on the combined training + validation data (90% of the total) for the 4 selected model–data version configurations. The held-out 10% test set (`test_holdout`) remains completely untouched until final evaluation.
+The single train-validation split above gave us an initial ranking, but a single split is subject to high variability — the estimated test error can fluctuate substantially depending on which observations happen to fall in the validation set. To obtain a more reliable and stable estimate of generalisation error, we perform **10-fold cross-validation** on the combined training + validation data (90% of the total) for the 4 selected model-data version configurations. The held-out 10% test set remains completely untouched until final evaluation, preserving its integrity as an unbiased estimate of true out-of-sample performance.
 
 For KNN, which has a tuneable hyperparameter (the number of neighbours $k$), we additionally search over $k \in \{5, 10, 15, 20\}$ within the cross-validation loop.
 
-**Pipeline approach.** A critical requirement is that *all preprocessing* — imputation, scaling, and (where applicable) PCA — must be fitted on the training folds and applied to the held-out validation fold within each iteration. If we were to impute or scale using the full dataset before splitting into folds, information from the validation fold would leak into the training folds, producing optimistically biased error estimates. We use the `recipes` package from `tidymodels` to define reusable preprocessing pipelines that enforce this discipline: each recipe is `prep()`-ed on the training folds and `bake()`-d onto the validation fold, guaranteeing that no information flows in the wrong direction.
+**Pipeline approach.** A critical requirement is that *all preprocessing* must be fitted on the training folds and applied to the held-out validation fold within each iteration as discussed earlier. We use the `recipes` package from `tidymodels` to define reusable preprocessing pipelines that enforce this discipline: each recipe is `prep()`-ed on the training folds and `bake()`-d onto the validation fold, guaranteeing that no information flows in the wrong direction.
 
 ```{r cv-setup}
 # install.packages("recipes")  # uncomment on first run
@@ -1268,11 +1507,10 @@ cat("BIC predictors:", paste(bic_predictors, collapse = ", "), "\n")
 
 We define three recipes — one per data version — that encode the full preprocessing pipeline:
 
-1. **Imputation**: predict missing `arrival_delay_in_minutes` from `departure_delay_in_minutes` using `step_impute_linear()`.
-2. **Scaling**: z-score standardisation for continuous variables (`step_normalize()`), min-max scaling for ordinal ratings (`step_range()`).
-3. **Dummy encoding**: create indicator variables for the categorical predictors (`step_dummy()`).
-4. **PCA** (PCA version only): `step_pca()` retaining components for 90% of variance.
-5. **Variable selection** (BIC version only): keep only the BIC-selected predictors (`step_select()`).
+1.  **Imputation**: predict missing `arrival_delay_in_minutes` from `departure_delay_in_minutes` using `step_impute_linear()`.
+2.  **Scaling**: z-score standardisation for continuous variables (`step_normalize()`), min-max scaling for ordinal ratings (`step_range()`).
+3.  **Dummy encoding**: create indicator variables for the categorical predictors (`step_dummy()`).
+4.  **Variable selection** (BIC version only): keep only the BIC-selected predictors (`step_select()`).
 
 ```{r define-recipes}
 # --- Base recipe (shared preprocessing steps) ---
@@ -1301,19 +1539,22 @@ make_recipe_bic <- function(data) {
     step_dummy(all_of(intersect(cat_vars, bic_predictors)))
 }
 
-# --- PCA recipe: full preprocessing then PCA ---
-make_recipe_pca <- function(data) {
-  base_recipe(data) %>%
-    step_pca(all_predictors(), threshold = 0.90)
-}
+#
+# --- PCA recipe: full preprocessing then PCA (CV-optimal number of components) ---
+#make_recipe_pca <- function(data) {
+#  base_recipe(data) %>%
+#    step_pca(all_predictors(), num_comp = n_pc_optimal)
+#}
+#
 ```
 
 ### Cross-Validation Loop
 
 ```{r}
+selected_configs$Method[selected_configs$Method=="KNN5"] = "KNN"
+selected_configs$Model[selected_configs$Model %in% c("KNN5 BIC", "KNN5 Full")] = c("KNN BIC","KNN Full")
 selected_configs
 ```
-
 
 ```{r cv-loop, cache=TRUE}
 # KNN k values to try
@@ -1354,7 +1595,7 @@ for (cfg_i in seq_len(nrow(selected_configs))) {
     "PCA"  = make_recipe_pca
   )
 
-  if (method == "KNN5") {
+  if (method == "KNN") {
     # KNN: store results for each k value
     for (k_val in knn_k_values) {
       result_name <- paste0(cfg_name, " (k=", k_val, ")")
@@ -1403,7 +1644,7 @@ for (cfg_i in seq_len(nrow(selected_configs))) {
         cv_results[[cfg_name]][f] <- get_auc(probs, va_lab)
         cv_f1_results[[cfg_name]][f] <- get_f1(probs, va_lab)
 
-      } else if (method == "KNN5") {
+      } else if (method == "KNN") {
         # Prepare numeric matrices for knn()
         tr_x <- tr_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
         va_x <- va_baked %>% dplyr::select(-satisfaction) %>% as.data.frame()
@@ -1455,12 +1696,13 @@ cv_long$Configuration <- factor(cv_long$Configuration,
                                  levels = rev(cv_summary$Configuration))
 
 ggplot(cv_long, aes(x = Configuration, y = AUC, fill = Configuration)) +
-  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE, width = 0.6) +
   coord_flip() +
-  labs(title = "10-Fold Cross-Validation: AUC Distribution",
-       subtitle = "KNN configurations shown with different k values",
-       x = "", y = "AUC") +
-  theme_minimal(base_size = 11)
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "10-Fold Cross-Validation: AUC Distribution by Configuration",
+       subtitle = "KNN configurations include multiple values of k; box shows inter-fold variability",
+       x = NULL, y = "AUC") +
+  theme_report(base_size = 12)
 ```
 
 ### Best Configuration
@@ -1487,7 +1729,9 @@ for (i in seq_len(nrow(cv_summary))) {
               cv_summary$Mean_AUC[i], cv_summary$SD_AUC[i]))
 }
 ```
-## Logistic Regression with L1 and L2 penalty
+
+## Logistic Regression with L1 and L2 Regularisation
+
 ```{r}
 #install.packages("tidymodels")
 library(tidymodels)
@@ -1593,8 +1837,9 @@ cv_glmnet_grid <- function(data,
   )
 }
 ```
+
 ```{r}
-lambda_grid <- c(0.0001, 0.001, 0.01, 0.1, 1, 10)
+lambda_grid <- 10^seq(-5, 2, length.out = 20)
 ridge_cv <- cv_glmnet_grid(
   data = cv_data,
   fold_ids = fold_ids,
@@ -1615,6 +1860,7 @@ lasso_cv <- cv_glmnet_grid(
 ridge_cv$summary
 lasso_cv$summary
 ```
+
 ```{r ridge-cv-plot, fig.height=5, fig.width=8}
 ggplot(ridge_cv$summary, aes(x = lambda, y = mean_auc)) +
   geom_ribbon(aes(ymin = mean_auc - sd_auc, ymax = mean_auc + sd_auc),
@@ -1625,14 +1871,14 @@ ggplot(ridge_cv$summary, aes(x = lambda, y = mean_auc)) +
              shape = 21, size = 5, stroke = 1.2, color = "#3498DB", fill = "white") +
   geom_text(data = ridge_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
             aes(label = sprintf("%.4f", mean_auc)),
-            vjust = -1.4, size = 3.5, color = "#2C3E50") +
+            vjust = -1.4, size = 4, fontface = "bold", color = "#2C3E50") +
   scale_x_log10(labels = scales::label_number()) +
   coord_cartesian(ylim = c(0.80, 0.95)) +
   labs(title = "Ridge (L2) Logistic Regression: 10-Fold CV AUC",
-       subtitle = "Shaded band = ± 1 SD; circled point = best λ",
-       x = expression(lambda ~ "(log scale)"), y = "Mean CV AUC") +
-  theme_minimal(base_size = 12) +
-  theme(plot.subtitle = element_text(color = "grey40"))
+       subtitle = expression("Shaded band = \u00b1 1 SD across folds; circled point = optimal " * lambda),
+       x = expression(Regularisation~Parameter~lambda ~ "(log scale)"),
+       y = "Mean Cross-Validated AUC") +
+  theme_report()
 ```
 
 ```{r lasso-cv-plot, fig.height=5, fig.width=8}
@@ -1645,31 +1891,434 @@ ggplot(lasso_cv$summary, aes(x = lambda, y = mean_auc)) +
              shape = 21, size = 5, stroke = 1.2, color = "#E74C3C", fill = "white") +
   geom_text(data = lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
             aes(label = sprintf("%.4f", mean_auc)),
-            vjust = -1.4, size = 3.5, color = "#2C3E50") +
+            vjust = -1.4, size = 4, fontface = "bold", color = "#2C3E50") +
   scale_x_log10(labels = scales::label_number()) +
   coord_cartesian(ylim = c(0.45, 0.95)) +
   labs(title = "Lasso (L1) Logistic Regression: 10-Fold CV AUC",
-       subtitle = "Shaded band = ± 1 SD; circled point = best λ",
-       x = expression(lambda ~ "(log scale)"), y = "Mean CV AUC") +
-  theme_minimal(base_size = 12) +
-  theme(plot.subtitle = element_text(color = "grey40"))
+       subtitle = expression("Shaded band = \u00b1 1 SD across folds; circled point = optimal " * lambda),
+       x = expression(Regularisation~Parameter~lambda ~ "(log scale)"),
+       y = "Mean Cross-Validated AUC") +
+  theme_report()
+```
+
+```{r lasso-cv-plot, fig.height=5, fig.width=8}
+ggplot(lasso_cv$summary, aes(x = lambda, y = mean_auc)) +
+  geom_ribbon(aes(ymin = mean_auc - sd_auc, ymax = mean_auc + sd_auc),
+              alpha = 0.15, fill = "#E74C3C") +
+  geom_line(color = "#E74C3C", linewidth = 1) +
+  geom_point(color = "#E74C3C", size = 2.5) +
+  geom_point(data = lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+             shape = 21, size = 5, stroke = 1.2, color = "#E74C3C", fill = "white") +
+  geom_text(data = lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE),
+            aes(label = sprintf("%.4f", mean_auc)),
+            vjust = -1.4, size = 4, fontface = "bold", color = "#2C3E50") +
+  scale_x_log10(labels = scales::label_number()) +
+  coord_cartesian(ylim = c(0.85, 0.95)) +
+  labs(title = "Lasso (L1) Logistic Regression: 10-Fold CV AUC",
+       subtitle = expression("Shaded band = \u00b1 1 SD across folds; circled point = optimal " * lambda),
+       x = expression(Regularisation~Parameter~lambda ~ "(log scale)"),
+       y = "Mean Cross-Validated AUC") +
+  theme_report()
+```
+
+```{r lasso-cv-plot, fig.height=5, fig.width=8}
+lasso_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE)
+ridge_cv$summary %>% slice_max(mean_auc, n = 1, with_ties = FALSE)
 ```
 
 ### Why Penalised Methods?
 
-We explored Ridge (L2) and Lasso (L1) regularisation for two reasons. First, penalised methods can improve generalisation by shrinking coefficients toward zero, reducing overfitting — particularly when predictors are correlated (as several service ratings are in this dataset). Second, Lasso has the additional property of performing implicit feature selection by driving some coefficients to exactly zero, offering an alternative to the explicit BIC-based stepwise approach used earlier.
+Ridge and Lasso regularisation add a penalty term to the likelihood, shrinking coefficient estimates toward zero and trading a small increase in bias for a possible reduction in variance. Ridge (L2) shrinks all coefficients continuously, while Lasso (L1) can shrink some coefficients exactly to zero, thereby performing implicit variable selection. We consider both methods here because the model contains 23 predictors, including several service-rating variables that may carry overlapping information, so regularisation may improve stability and offer a useful comparison with the subset-selection approaches considered earlier.
 
 ### Results and Interpretation
 
-Both Ridge and Lasso achieve their best AUC at very small $\lambda$ values ($\lambda \leq 0.001$), where the penalty is negligible and the models approximate standard unpenalised logistic regression. At these optimal values, both methods match the unpenalised GLM Full cross-validated AUC of approximately 0.927. As $\lambda$ increases, Ridge degrades smoothly — its AUC declines from 0.927 to 0.836 at $\lambda = 10$ — because L2 regularisation shrinks all coefficients proportionally but never eliminates them entirely. Lasso, by contrast, shows a sharp cliff: at $\lambda = 0.1$ the AUC drops to 0.667, and by $\lambda \geq 1$ it collapses to exactly 0.5 (random guessing) with zero variance across folds, meaning that all predictor coefficients have been driven to zero.
+Both Ridge and Lasso achieve their highest cross-validated AUC at extremely small values of $\lambda$, indicating that only negligible regularisation is preferred. Specifically, the optimal Ridge value is $\lambda = 0.0001274$ with mean CV AUC $= 0.9267$, while the optimal Lasso value is $\lambda = 0.0002976$ with mean CV AUC $= 0.9267$. These values are so close to zero that both penalised models are effectively equivalent to the unpenalised full logistic regression model.
 
-The fact that neither penalised method improves upon the unpenalised logistic regression confirms that the full predictor set is already well-conditioned: there is no meaningful overfitting to regularise away, and the BIC-selected subset (which dropped only 4 weak variables out of 23) was already a near-optimal reduction.
+As $\lambda$ increases, performance becomes worse for both methods. Ridge declines gradually, reflecting the fact that L2 regularisation continuously shrinks all coefficients without eliminating them. Lasso shows a sharper drop for moderate and large $\lambda$, and eventually approaches AUC $= 0.5$, indicating that excessive L1 penalisation shrinks all coefficients to zero and the model loses predictive ability.
+
+Overall, neither penalised method improves meaningfully over the unpenalised logistic model.
+
+## Generalized Additive Models (GAMs)
+
+Logistic regression assumes that each predictor exerts a strictly linear effect on the log-odds of the response. GAMs relax this assumption by replacing each linear term $\beta_j x_j$ with a flexible smooth function $f_j(x_j)$, while preserving the additive structure that makes the model interpretable:
+
+$$\log\!\left(\frac{p}{1-p}\right) = \beta_0 + f_1(x_1) + f_2(x_2) + \cdots + f_p(x_p)$$
+
+This allows each predictor to exert a potentially nonlinear effect on the log-odds of satisfaction. We focus on logistic GAMs fit directly with `mgcv::gam()` and compare nested specifications via AIC, ANOVA, ROC curves, and cross-validation.
+
+```{r gam-libraries, message=FALSE, warning=FALSE}
+library(mgcv)
+```
+
+### Data Preparation for GAMs
+
+The GAM analysis uses the **BIC-reduced predictor set**, which drops `flight_distance`, `gate_location`, `food_and_drink`, and `gender` from the full model. The three BIC continuous predictors are `age`, `departure_delay_in_minutes`, and `arrival_delay_in_minutes`.
+
+```{r}
+bic_predictors
+```
+
+```{r gam-data-prep, warning=FALSE}
+# BIC continuous predictors: age, departure_delay, arrival_delay
+# (flight_distance dropped by BIC)
+bic_cont_gam   <- intersect(cont_vars,   bic_predictors)
+bic_rating_gam <- intersect(rating_vars, bic_predictors)
+bic_cat_gam    <- intersect(cat_vars,    bic_predictors)
+
+cat("BIC continuous predictors for GAMs:", paste(bic_cont_gam, collapse = ", "), "\n")
+
+# Build GAM training data from 'train' (already imputed, satisfaction as factor)
+train_gam <- train %>%
+  dplyr::select(satisfaction, all_of(bic_predictors))
+
+# Z-score continuous (using training data parameters)
+gam_cont_means <- colMeans(train_gam[, bic_cont_gam])
+gam_cont_sds   <- apply(train_gam[, bic_cont_gam], 2, sd)
+train_gam[, bic_cont_gam] <- scale(train_gam[, bic_cont_gam],
+                                    center = gam_cont_means,
+                                    scale  = gam_cont_sds)
+
+# Min-max rating variables
+gam_rating_mins   <- apply(train_gam[, bic_rating_gam], 2, min)
+gam_rating_ranges <- apply(train_gam[, bic_rating_gam], 2, max) - gam_rating_mins
+for (v in bic_rating_gam) {
+  train_gam[[v]] <- (train_gam[[v]] - gam_rating_mins[v]) / gam_rating_ranges[v]
+}
+
+cat("train_gam dimensions:", dim(train_gam), "\n")
+cat("Remaining NAs:", sum(is.na(train_gam)), "\n")
+```
+
+### Fitting a Logistic GAM (Section 7.7.2)
+
+We now fit the logistic GAMs. Ratings and categorical predictors remain linear, while the three continuous predictors are progressively allowed to enter as smooth terms across the nested specifications.
+
+```{r gam-full-fit, warning=FALSE}
+gam_fit_full <- mgcv::gam(
+  satisfaction ~ 
+    s(age) +
+    s(departure_delay_in_minutes) +
+    s(arrival_delay_in_minutes) +
+    online_boarding + seat_comfort + inflight_entertainment + on_board_service +
+    leg_room_service + baggage_handling + checkin_service + inflight_service + cleanliness +
+    ease_of_online_booking + inflight_wifi_service + departure_arrival_time_convenient +
+    customer_type + type_of_travel + class,
+  data = train_gam,
+  family = binomial,
+  method = "REML"
+)
+summary(gam_fit_full)
+```
+
+```{r gam-smooth-plots, fig.height=4, fig.width=12, warning=FALSE}
+# Plot the estimated smooth functions with +/- 2 SE confidence bands
+par(mfrow = c(1, 3), mar = c(5, 5, 3, 1), family = "sans")
+plot(gam_fit_full, se = TRUE, col = "#3498DB", lwd = 2.5,
+     shade = TRUE, shade.col = adjustcolor("#3498DB", alpha.f = 0.15),
+     cex.lab = 1.2, cex.axis = 1.1, cex.main = 1.2)
+par(mfrow = c(1, 1))
+```
+
+These smooth plots display the estimated partial effect of each continuous predictor on the log-odds of satisfaction, holding the remaining predictors fixed. The dashed curves represent approximate $\pm 2$ standard error bands around each smooth.
+
+For `age`, the estimated smooth is nearly flat, with only a very mild decline at higher values, suggesting little evidence of a strong nonlinear effect. For `departure_delay_in_minutes`, the fitted smooth is also essentially flat, and the confidence bands widen substantially at larger delays, indicating high uncertainty and limited evidence of a meaningful effect. For `arrival_delay_in_minutes`, the smooth shows some mild fluctuation, but the uncertainty becomes very large in the upper range, so any observed nonlinearity should be interpreted cautiously.
+
+Overall, the GAM smooths suggest that these continuous predictors contribute only weakly and that there is no strong or stable nonlinear pattern beyond minor fluctuations.
+
+### GAM Model Comparison
+
+We compare four nested GAM specifications fitted on `train_gam` (BIC predictors), varying whether the three continuous predictors enter linearly or as smooth terms:
+
+-   **M1**: All BIC predictors enter linearly (equivalent to BIC logistic regression)
+-   **M2**: `age` gets a smooth spline; `departure_delay` and `arrival_delay` remain linear
+-   **M3**: `age` and `departure_delay` get a smooth spline: `arrival_delay` remain linear
+-   **M4**: `age`, `departure_delay` and `arrival_delay` get a smooth spline
+
+The nesting M1 ⊂ M2 ⊂ M3 allows chi-squared deviance tests of whether each additional smooth term significantly improves fit.
+
+```{r gam-lab-models, warning=FALSE}
+# Ratings + categorical predictors remain linear in every specification.
+
+# M1: all BIC predictors linear
+gam_m1 <- mgcv::gam(
+  satisfaction ~ 
+    age +
+    departure_delay_in_minutes + arrival_delay_in_minutes +
+    online_boarding + seat_comfort + inflight_entertainment + on_board_service +
+    leg_room_service + baggage_handling + checkin_service + inflight_service + cleanliness +
+    ease_of_online_booking + inflight_wifi_service + departure_arrival_time_convenient +
+    customer_type + type_of_travel + class,
+  data = train_gam, family = binomial, method = "REML"
+)
+
+# M2: smooth age
+gam_m2 <- mgcv::gam(
+  satisfaction ~ 
+    s(age) +
+    departure_delay_in_minutes + arrival_delay_in_minutes +
+    online_boarding + seat_comfort + inflight_entertainment + on_board_service +
+    leg_room_service + baggage_handling + checkin_service + inflight_service + cleanliness +
+    ease_of_online_booking + inflight_wifi_service + departure_arrival_time_convenient +
+    customer_type + type_of_travel + class,
+  data = train_gam, family = binomial, method = "REML"
+)
+
+# M3: smooth age and departure delay
+gam_m3 <- mgcv::gam(
+  satisfaction ~ 
+    s(age) + s(departure_delay_in_minutes) + arrival_delay_in_minutes +
+    online_boarding + seat_comfort + inflight_entertainment + on_board_service +
+    leg_room_service + baggage_handling + checkin_service + inflight_service + cleanliness +
+    ease_of_online_booking + inflight_wifi_service + departure_arrival_time_convenient +
+    customer_type + type_of_travel + class,
+  data = train_gam, family = binomial, method = "REML"
+)
+
+# M4: smooth age, departure delay, and arrival delay
+gam_m4 <- mgcv::gam(
+  satisfaction ~ 
+    s(age) + s(departure_delay_in_minutes) + s(arrival_delay_in_minutes) +
+    online_boarding + seat_comfort + inflight_entertainment + on_board_service +
+    leg_room_service + baggage_handling + checkin_service + inflight_service + cleanliness +
+    ease_of_online_booking + inflight_wifi_service + departure_arrival_time_convenient +
+    customer_type + type_of_travel + class,
+  data = train_gam, family = binomial, method = "REML"
+)
+
+cat("=== AIC Comparison (BIC data) ===\n")
+cat(sprintf("M1 (All linear)                         : AIC = %.2f\n", AIC(gam_m1)))
+cat(sprintf("M2 (Smooth age)                        : AIC = %.2f\n", AIC(gam_m2)))
+cat(sprintf("M3 (Smooth age + departure delay)      : AIC = %.2f\n", AIC(gam_m3)))
+cat(sprintf("M4 (Smooth age + departure + arrival)  : AIC = %.2f\n", AIC(gam_m4)))  
+```
+
+```{r gam-anova, warning=FALSE}
+# Formal chi-squared deviance test across the nested GAM sequence
+anova(gam_m1, gam_m2,gam_m3,gam_m4, test = "Chisq")
+```
+
+```{r gam-training-auc, warning=FALSE}
+lab_train_gam <- train_gam$satisfaction
+
+prob_gam_m1 <- predict(gam_m1, type = "response")
+prob_gam_m2 <- predict(gam_m2, type = "response")
+prob_gam_m3 <- predict(gam_m3, type = "response")
+prob_gam_m4 <- predict(gam_m4, type = "response")
+
+cat("\n=== Training AUC Comparison ===\n")
+cat(sprintf("M1 (All linear)                          : %.4f\n",
+            get_auc(prob_gam_m1,   lab_train_gam)))
+cat(sprintf("M2 (Smooth age)                          : %.4f\n",
+            get_auc(prob_gam_m2, lab_train_gam)))
+cat(sprintf("M3 (Smooth age + departure delay)        : %.4f\n",
+            get_auc(prob_gam_m3, lab_train_gam)))
+cat(sprintf("M4 (Smooth age + departure + arrival)    : %.4f\n",
+            get_auc(prob_gam_m4, lab_train_gam)))
+```
+
+```{r gam-roc-comparison, fig.height=5, fig.width=8, warning=FALSE}
+roc_gam_m1 <- roc(lab_train_gam, prob_gam_m1,
+                  levels = c("neutral or dissatisfied","satisfied"),
+                  direction = "<", quiet = TRUE)
+roc_gam_m2 <- roc(lab_train_gam, prob_gam_m2,
+                  levels = c("neutral or dissatisfied","satisfied"),
+                  direction = "<", quiet = TRUE)
+roc_gam_m3 <- roc(lab_train_gam, prob_gam_m3,
+                  levels = c("neutral or dissatisfied","satisfied"),
+                  direction = "<", quiet = TRUE)
+roc_gam_m4 <- roc(lab_train_gam, prob_gam_m4,
+                  levels = c("neutral or dissatisfied","satisfied"),
+                  direction = "<", quiet = TRUE)
+
+par(mar = c(4.5, 4.5, 3, 1), family = "sans")
+plot(roc_gam_m1, col = "#E74C3C", lwd = 2.5,
+     main = "ROC Curves \u2014 Nested GAM Specifications (Training Set)",
+     legacy.axes = TRUE, cex.main = 1.1, font.main = 2,
+     xlab = "False Positive Rate (1 \u2212 Specificity)",
+     ylab = "True Positive Rate (Sensitivity)")
+plot(roc_gam_m2, col = "#E67E22", lwd = 2.5, add = TRUE, legacy.axes = TRUE)
+plot(roc_gam_m3, col = "#2ECC71", lwd = 2.5, add = TRUE, legacy.axes = TRUE)
+plot(roc_gam_m4, col = "#3498DB", lwd = 2.5, add = TRUE, legacy.axes = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+legend("bottomright",
+       legend = c(
+         sprintf("M1: All Linear (AUC = %.4f)", auc(roc_gam_m1)),
+         sprintf("M2: Smooth age (AUC = %.4f)", auc(roc_gam_m2)),
+         sprintf("M3: + Smooth dep. delay (AUC = %.4f)", auc(roc_gam_m3)),
+         sprintf("M4: + Smooth arr. delay (AUC = %.4f)", auc(roc_gam_m4))
+       ),
+       col = c("#E74C3C", "#E67E22", "#2ECC71", "#3498DB"),
+       lwd = 2.5, cex = 0.8, bty = "n")
+```
+
+### Cross-Validation for GAM Models
+
+Training AUC is optimistic. We apply 10-fold CV using the same pipeline discipline as throughout: all preprocessing is fitted on each training fold and applied to the held-out fold. We define a dedicated recipe for GAMs that uses only the BIC predictors with standard scaling.
+
+```{r gam-recipe}
+# BIC recipe for GAMs
+make_recipe_bic_gam <- function(data) {
+  recipe(satisfaction ~ ., data = data) %>%
+    # 1. Impute arrival_delay from departure_delay
+    step_impute_linear(arrival_delay_in_minutes,
+                       impute_with = imp_vars(departure_delay_in_minutes)) %>%
+    # 2. Drop non-BIC predictors
+    step_rm(-satisfaction, -all_of(bic_predictors)) %>%
+    # 3. Z-score continuous, min-max ratings, dummy encode categoricals
+    step_normalize(all_of(intersect(cont_vars,   bic_predictors))) %>%
+    step_range(all_of(intersect(rating_vars, bic_predictors)), min = 0, max = 1) %>%
+    step_dummy(all_of(intersect(cat_vars,    bic_predictors)))
+}
+```
+
+```{r gam-cv, cache=TRUE, warning=FALSE}
+gam_m1_aucs <- numeric(n_folds)
+gam_m2_aucs <- numeric(n_folds)
+gam_m3_aucs <- numeric(n_folds)
+gam_m4_aucs <- numeric(n_folds)
+
+for (f in seq_len(n_folds)) {
+  cat(sprintf("\rGAM CV: fold %d / %d   ", f, n_folds))
+
+  idx_val <- fold_ids[[f]]
+  tr_raw  <- cv_data[-idx_val, ]
+  va_raw  <- cv_data[idx_val, ]
+
+  # BIC recipe: fitted on training fold, applied to both
+  rec    <- make_recipe_bic_gam(tr_raw) %>% prep(training = tr_raw)
+  tr_bak <- bake(rec, new_data = NULL)
+  va_bak <- bake(rec, new_data = va_raw)
+  va_lab <- va_bak$satisfaction
+
+  # Identify variable groups in the baked output
+  baked_cols   <- colnames(tr_bak)
+  cont_baked   <- intersect(cont_vars, baked_cols)   # age, dep_delay, arr_delay
+  rating_baked <- intersect(rating_vars, baked_cols)
+  dummy_baked  <- setdiff(baked_cols, c("satisfaction", cont_baked, rating_baked))
+
+  # Variable names after baking
+  age_col       <- intersect("age", cont_baked)
+  dep_delay_col <- intersect("departure_delay_in_minutes", cont_baked)
+  arr_delay_col <- intersect("arrival_delay_in_minutes", cont_baked)
+
+  # Common linear terms
+  lin_common <- c(rating_baked, dummy_baked)
+
+  # RHS for each model
+  rhs_m1 <- paste(c(age_col, dep_delay_col, arr_delay_col, lin_common), collapse = " + ")
+  rhs_m2 <- paste(c("s(age)", dep_delay_col, arr_delay_col, lin_common), collapse = " + ")
+  rhs_m3 <- paste(c("s(age)", "s(departure_delay_in_minutes)", arr_delay_col, lin_common), collapse = " + ")
+  rhs_m4 <- paste(c("s(age)", "s(departure_delay_in_minutes)", "s(arrival_delay_in_minutes)", lin_common), collapse = " + ")
+
+  tryCatch({
+    # M1: all BIC predictors linear
+    fit_m1 <- mgcv::gam(
+      as.formula(paste("satisfaction ~", rhs_m1)),
+      data = tr_bak, family = binomial, method = "REML"
+    )
+    gam_m1_aucs[f] <- get_auc(predict(fit_m1, va_bak, type = "response"), va_lab)
+
+    # M2: smooth age
+    fit_m2 <- mgcv::gam(
+      as.formula(paste("satisfaction ~", rhs_m2)),
+      data = tr_bak, family = binomial, method = "REML"
+    )
+    gam_m2_aucs[f] <- get_auc(predict(fit_m2, va_bak, type = "response"), va_lab)
+
+    # M3: smooth age + smooth departure delay
+    fit_m3 <- mgcv::gam(
+      as.formula(paste("satisfaction ~", rhs_m3)),
+      data = tr_bak, family = binomial, method = "REML"
+    )
+    gam_m3_aucs[f] <- get_auc(predict(fit_m3, va_bak, type = "response"), va_lab)
+
+    # M4: smooth age + smooth departure delay + smooth arrival delay
+    fit_m4 <- mgcv::gam(
+      as.formula(paste("satisfaction ~", rhs_m4)),
+      data = tr_bak, family = binomial, method = "REML"
+    )
+    gam_m4_aucs[f] <- get_auc(predict(fit_m4, va_bak, type = "response"), va_lab)
+
+  }, error = function(e) {
+    cat("\n  Error in fold", f, ":", conditionMessage(e), "\n")
+  })
+}
+cat("\nGAM cross-validation complete.\n")
+```
+
+```{r gam-cv-results}
+gam_cv_df <- data.frame(
+  Model = c("M1: BIC linear (logistic)",
+            "M2: Smooth age",
+            "M3: Smooth age + departure delay",
+            "M4: Smooth age + departure + arrival delay"),
+  
+  Mean_AUC = round(c(mean(gam_m1_aucs, na.rm = TRUE),
+                     mean(gam_m2_aucs, na.rm = TRUE),
+                     mean(gam_m3_aucs, na.rm = TRUE),
+                     mean(gam_m4_aucs, na.rm = TRUE)), 4),
+  
+  SD_AUC = round(c(sd(gam_m1_aucs, na.rm = TRUE),
+                   sd(gam_m2_aucs, na.rm = TRUE),
+                   sd(gam_m3_aucs, na.rm = TRUE),
+                   sd(gam_m4_aucs, na.rm = TRUE)), 4)
+) %>%
+  arrange(desc(Mean_AUC))
+
+gam_cv_df %>%
+  kable(row.names = FALSE,
+        col.names = c("Model", "Mean CV AUC", "SD CV AUC"),
+        caption = "10-fold CV AUC: GAM Specifications (BIC data, pipeline)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r gam-cv-boxplot, fig.height=4, fig.width=9, warning=FALSE}
+gam_cv_long <- data.frame(
+  AUC = c(gam_m1_aucs, gam_m2_aucs, gam_m3_aucs, gam_m4_aucs),
+  Model = rep(
+    c("M1: All Linear",
+      "M2: Smooth age",
+      "M3: Smooth age + dep delay",
+      "M4: Smooth age + dep + arr delay"),
+    each = n_folds
+  )
+)
+
+gam_cv_long$Model <- factor(
+  gam_cv_long$Model,
+  levels = c("M1: All Linear",
+             "M2: Smooth age",
+             "M3: Smooth age + dep delay",
+             "M4: Smooth age + dep + arr delay")
+)
+
+ggplot(gam_cv_long, aes(x = Model, y = AUC, fill = Model)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE, width = 0.6) +
+  scale_fill_manual(values = c("#E74C3C", "#E67E22", "#2ECC71", "#3498DB")) +
+  labs(
+    title = "10-Fold Cross-Validated AUC: GAM Specifications",
+    subtitle = "All preprocessing fitted within each fold; boxes display inter-fold variability",
+    x = NULL, y = "AUC"
+  ) +
+  theme_report() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+### GAM Results and Interpretation
+
+The ANOVA chi-squared comparisons indicate that introducing smooth terms for the continuous predictors (`age`, `departure_delay_in_minutes`, and `arrival_delay_in_minutes`) leads to a statistically significant improvement in model fit. Consistent with this, the cross-validation results show that the GAM specification with smooth terms for all three variables (M4) achieves the highest CV AUC among the GAM models and outperforms the baseline logistic regression fitted on the BIC-selected data.
+
+However, the improvement over the linear logistic model remains modest. When compared to alternative methods, the KNN models—particularly with $k = 15$ and $k = 10$—achieve higher cross-validated AUC values.
+
+Therefore, although the GAM model provides a better fit than the standard logistic regression by capturing mild nonlinear effects, it does not match the predictive performance of the top KNN models.
 
 ## Threshold Optimisation for Top KNN Models
 
-Cross-validation identified two KNN configurations as the top performers: **KNN (k = 15)** with a mean CV AUC of 0.9777 and mean CV F1 of 0.9118, and **KNN (k = 10)** with a mean CV AUC of 0.9757 and mean CV F1 of 0.9165. Both are very close in performance, and both used the default classification threshold of 0.5. However, the optimal threshold for maximising F1 may differ from 0.5, particularly with moderate class imbalance. We therefore retrain each model on the full training set (`train_with_na`) and sweep across a fine threshold grid on the validation set to identify the threshold that maximises F1 for each model.
+All classifiers evaluated so far used the default decision threshold $t = 0.50$: an observation is classified as "satisfied" if $\hat{P}(\text{satisfied} \mid X) \geq 0.50$. However the optimal threshold depends on the relative costs of false positives and false negatives and on the class prior. With our moderate class imbalance (\$\sim\$57% dissatisfied), the optimal threshold may deviate from 0.50. We therefore perform a post-hoc threshold sweep to identify the value that maximises the F1 score — a metric that balances precision and recall and is more appropriate than accuracy in the presence of class imbalance.
 
-```{r threshold-optimisation, fig.height=6, fig.width=9}
+The analysis so far identified two KNN configurations as the top performers: **KNN (**$k = 15$) with a mean CV AUC of 0.9777 and mean CV F1 of 0.9118, and **KNN (**$k = 10$) with a mean CV AUC of 0.9757 and mean CV F1 of 0.9165. We retrain each model on the full training set and sweep across a fine threshold grid $t \in [0.01, 0.99]$ on the validation set to identify the F1-maximising threshold for each.
+
+```{r threshold-optimisation, fig.height=5, fig.width=9}
 # --- Retrain both KNN models on train set, predict on validation set ---
 # Preprocess: fit BIC recipe on train_with_na, bake both train and val
 rec_bic <- make_recipe_bic(train_with_na) %>% prep(training = train_with_na)
@@ -1733,31 +2382,41 @@ cat(sprintf("KNN k=10: threshold = %.2f, F1 = %.4f\n", best_t10, best_f1_10))
 
 # --- Plot ---
 ggplot(f1_df, aes(x = Threshold, y = F1, color = Model)) +
-  geom_line(linewidth = 1) +
+  geom_line(linewidth = 1.1) +
+  # Coloured vertical lines at optimal thresholds (replace inline labels)
+  geom_vline(xintercept = best_t15, linetype = "dashed",
+             color = "#3498DB", linewidth = 0.7, alpha = 0.8) +
+  geom_vline(xintercept = best_t10, linetype = "dashed",
+             color = "#E74C3C", linewidth = 0.7, alpha = 0.8) +
+  # Optimal points on the curves
   geom_point(data = best_points, aes(x = Threshold, y = F1),
              shape = 21, size = 5, stroke = 1.3, fill = "white") +
-  geom_text(data = best_points, aes(label = Label),
-            vjust = -1.3, hjust = 0.5, size = 3.5, show.legend = FALSE) +
-  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey50", linewidth = 0.5) +
-  annotate("text", x = 0.51, y = min(f1_df$F1) + 0.02,
-           label = "Default (0.5)", hjust = 0, size = 3, color = "grey40") +
-  scale_color_manual(values = c("KNN (k = 15)" = "#3498DB", "KNN (k = 10)" = "#E74C3C")) +
+  # Default threshold
+  geom_vline(xintercept = 0.5, linetype = "dotted",
+             color = "grey50", linewidth = 0.5) +
+  annotate("text", x = 0.515, y = min(f1_df$F1) + 0.003,
+           label = "Default\n(t = 0.5)", hjust = 0, size = 3, color = "grey50") +
+  # Clean summary box bottom-right — no overlap possible
+  annotate("label",
+           x = 0.68, y = min(f1_df$F1) + 0.006,
+           label = sprintf("KNN k=15:  t* = %.2f,  F1 = %.4f\nKNN k=10:  t* = %.2f,  F1 = %.4f",
+                           best_t15, best_f1_15, best_t10, best_f1_10),
+           hjust = 0, size = 3.5, color = "grey20", fill = "white",
+           label.padding = ggplot2::unit(0.4, "lines"), label.size = 0.3) +
+  scale_color_manual(values = c("KNN (k = 15)" = "#3498DB",
+                                "KNN (k = 10)" = "#E74C3C")) +
   labs(
-    title = "F1 Score vs Classification Threshold — Top 2 KNN Models",
-    subtitle = "Trained on full training set; evaluated on validation set; circled points = optimal threshold",
-    x = "Classification Threshold", y = "F1 Score",
+    title = "F1 Score vs. Classification Threshold \u2014 Top KNN Models",
+    subtitle = "Dashed vertical lines mark the F1-maximising threshold for each model",
+    x = "Classification Threshold (t)", y = "F1 Score",
     color = "Model"
   ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    legend.position = "bottom",
-    plot.subtitle = element_text(color = "grey40")
-  )
+  theme_report()
 ```
 
-# Final Model: KNN (k = 15) — Test-Set Performance
+# Final Model: KNN ($k = 15$) — Held-Out Test Set Evaluation
 
-Based on cross-validation and threshold tuning, we select **KNN with k = 15** as the final model. It achieved the highest mean CV AUC (0.9777) and matched the best F1 on the validation set. The optimised threshold from the validation sweep is **t\* = 0.34**. We now evaluate this model on the **held-out test set** (`test_holdout`), which has not been used in any modelling or tuning decision.
+Having completed all model fitting and threshold tuning using only the training and validation data, we now evaluate our selected model — **KNN with** $k = 15$ on the BIC-reduced predictor set — on the **held-out test set** that has been completely untouched throughout the analysis. This is the definitive assessment of generalisation performance. The optimised classification threshold from the validation sweep is $t^* = 0.34$.
 
 ```{r final-model-test, fig.height=6, fig.width=8}
 # --- Preprocess: fit BIC recipe on train_with_na, bake train and test_holdout ---
@@ -1783,15 +2442,16 @@ roc_test <- roc(te_y_final, prob_test_satisfied, levels = c("neutral or dissatis
 cat("=== Test-Set ROC AUC ===\n")
 cat(sprintf("AUC = %.4f\n", auc(roc_test)))
 
-ggroc(roc_test, legacy.axes = TRUE, color = "#3498DB", linewidth = 1.2) +
+ggroc(roc_test, legacy.axes = TRUE, color = "#3498DB", linewidth = 1.4) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
   annotate("text", x = 0.55, y = 0.30,
            label = sprintf("AUC = %.4f", auc(roc_test)),
-           size = 5, fontface = "bold", color = "#2C3E50") +
-  labs(title = "ROC Curve — Final Model: KNN BIC (k = 15) on Held-Out Test Set",
-       x = "False Positive Rate (1 − Specificity)",
+           size = 5.5, fontface = "bold", color = "#2C3E50") +
+  labs(title = "ROC Curve \u2014 Final Model: KNN (k = 15, BIC Predictors) on Held-Out Test Set",
+       
+       x = "False Positive Rate (1 \u2212 Specificity)",
        y = "True Positive Rate (Sensitivity)") +
-  theme_minimal(base_size = 12)
+  theme_report()
 ```
 
 ## Confusion Matrices and Metrics
@@ -1837,12 +2497,13 @@ make_cm_plot <- function(cm_obj, title_str) {
   colnames(cm_df) <- c("Predicted", "Actual", "Freq")
   ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
     geom_tile(color = "white", linewidth = 1.5) +
-    geom_text(aes(label = format(Freq, big.mark = ",")), size = 5, fontface = "bold") +
+    geom_text(aes(label = format(Freq, big.mark = ",")),
+              size = 5.5, fontface = "bold") +
     scale_fill_gradient(low = "#F7F7F7", high = "#3498DB") +
-    labs(title = title_str, x = "Actual", y = "Predicted") +
-    theme_minimal(base_size = 12) +
+    labs(title = title_str, x = "Actual Class", y = "Predicted Class") +
+    theme_report(base_size = 12) +
     theme(legend.position = "none",
-          plot.title = element_text(hjust = 0.5, size = 11))
+          plot.title = element_text(hjust = 0.5, size = 12, face = "bold"))
 }
 
 p_cm1 <- make_cm_plot(res_050$cm, "Default Threshold (t = 0.50)")
@@ -1855,9 +2516,11 @@ gridExtra::grid.arrange(p_cm1, p_cm2, ncol = 2,
 ## Misclassification Analysis: Inspecting the 15 Nearest Neighbours
 
 To understand *why* the model misclassifies certain observations, we sample 6 misclassified test observations (3 false positives, 3 false negatives under the optimised threshold) and examine the composition and feature statistics of their 15 nearest neighbours in the training set.
+
 ```{r}
 install.packages("FNN")  # For get.knnx()
 ```
+
 ```{r misclass-analysis}
 # --- Identify misclassified observations at t = 0.34 ---
 pred_class_034 <- factor(
@@ -1989,7 +2652,7 @@ comp_df <- bind_rows(comparison_rows)
 comp_long <- comp_df %>%
   pivot_longer(cols = c(Test_Obs, Mean_Sat_NN, Mean_Dis_NN),
                names_to = "Source", values_to = "Value") %>%
-  mutate(Source = recode(Source,
+  mutate(Source = dplyr::recode(Source,
     "Test_Obs" = "Misclassified Obs",
     "Mean_Sat_NN" = "Satisfied Neighbours (mean)",
     "Mean_Dis_NN" = "Dissatisfied Neighbours (mean)"
@@ -2002,17 +2665,15 @@ ggplot(comp_long, aes(x = Feature, y = Value, fill = Source)) +
                                 "Satisfied Neighbours (mean)" = "#3498DB",
                                 "Dissatisfied Neighbours (mean)" = "#E74C3C")) +
   labs(
-    title = "Misclassified Observations vs Their 15 Nearest Neighbours",
-    subtitle = "Key service rating features (baked scale, 0–1); grouped bar = obs value vs neighbour means",
-    x = NULL, y = "Feature Value (scaled)",
+    title = "Misclassified Observations vs. Their 15 Nearest Neighbours",
+    subtitle = "Key service ratings (scaled 0\u20131); grouped bars compare the test observation with neighbourhood means by class",
+    x = NULL, y = "Feature Value (min-max scaled)",
     fill = NULL
   ) +
-  theme_minimal(base_size = 11) +
+  theme_report(base_size = 11) +
   theme(
-    axis.text.x = element_text(angle = 40, hjust = 1, size = 8),
-    legend.position = "bottom",
-    strip.text = element_text(face = "bold", size = 10),
-    plot.subtitle = element_text(color = "grey40")
+    axis.text.x = element_text(angle = 40, hjust = 1, size = 9),
+    strip.text = element_text(face = "bold", size = 10)
   )
 ```
 
@@ -2055,8 +2716,12 @@ cat(sprintf("  Test F1 (t=0.34)   : %.4f\n", res_034$f1))
 cat("================================================================\n")
 ```
 
-KNN with k = 15 on the BIC-reduced predictor set was selected as the final model because it achieved the highest cross-validated AUC (0.9777) among all model–data version configurations and outperformed penalised logistic regression (AUC ≈ 0.927). The model uses the 19 BIC-selected predictors (dummy-encoded), and threshold tuning on the validation set shifted the optimal decision boundary from 0.50 to 0.34, reflecting a slight class imbalance in favour of dissatisfied passengers.
+KNN with $k = 15$ on the BIC-reduced predictor set was selected as the final model based on a systematic comparison across five classification methods (Logistic Regression, LDA, QDA, KNN, Naive Bayes), three predictor configurations (Full, BIC-reduced, PCA-transformed), and additional exploration of penalised logistic regression (Ridge, Lasso) and Generalized Additive Models (GAMs). The model achieved the highest 10-fold cross-validated AUC (0.9777) among all configurations, substantially outperforming the parametric methods. This performance gap is consistent with the ISLR discussion of the bias-variance trade-off (Ch. 2): KNN's flexibility enables it to capture complex, potentially nonlinear decision boundaries in the feature space that linear methods cannot represent, and the large training set ($n \approx 100{,}000$) mitigates the variance penalty typically associated with nonparametric approaches.
 
-The misclassification analysis reveals that errors tend to occur in **boundary regions** of the feature space where the 15 nearest neighbours contain a near-even mix of both classes. These are passengers whose service ratings and travel characteristics place them between the two clusters — for example, a business traveller who gave high ratings on most service dimensions but low ratings on wifi and online boarding, or a personal traveller with moderate ratings across the board. The low margin (close-to-even neighbour splits) for these observations confirms that they are genuinely ambiguous cases rather than systematic model failures.
+The BIC-reduced predictor set (19 variables from forward stepwise selection) proved at least as effective as the full model across all methods, confirming that the four dropped predictors (`gate_location`, `food_and_drink`, `gender`, `flight_distance`) contribute negligible discriminative power. This convergence was independently corroborated by the LDA scaling coefficients, where these same variables received the small absolute 'weights'.
 
-The comparison of confusion matrices at t = 0.50 vs t = 0.34 shows that the lower threshold increases sensitivity (catching more truly satisfied passengers) at a modest cost to precision. This trade-off is appropriate if the business priority is to avoid missing satisfied passengers (e.g., for targeted loyalty programs), whereas t = 0.50 would be preferred if false positives are more costly.
+Threshold tuning on the validation set shifted the optimal decision boundary from the default $t = 0.50$ to $t = 0.34$, reflecting the moderate class imbalance (\$\sim\$57% dissatisfied) and the asymmetric cost structure implicit in the F1 metric, which equally weights precision and recall.
+
+The misclassification analysis reveals that errors tend to occur in **boundary regions** of the feature space where the 15 nearest neighbours contain a near-even mix of both classes. These are passengers whose service ratings and travel characteristics place them in the overlap between the satisfied and dissatisfied clusters — for example, a business traveller who gave high ratings on most service dimensions but low ratings on wifi and online boarding, or a personal traveller with moderate ratings across the board. The low margin (close-to-even neighbour splits) for these observations confirms that they are genuinely ambiguous cases lying near the Bayes decision boundary, rather than systematic model failures. This pattern is consistent with the irreducible error component emphasised in ISLR (Section 2.2): no classifier can correctly separate observations that are intrinsically indistinguishable in the available feature space.
+
+The comparison of confusion matrices at t = 0.50 vs t = 0.34 shows that the lower threshold increases sensitivity (catching more truly satisfied passengers) at a modest cost to precision. This trade-off is appropriate if the business priority is to avoid missing satisfied passengers, whereas t = 0.50 would be preferred if false positives (incorrectly predicting satisfaction) are more costly and a more conservative classification rule is desired.
